@@ -1,0 +1,11 @@
+[package]
+name = "urx-runtime-v08"
+version = "0.1.0"
+edition = "2021"
+description = "URX runtime v0.8 with scheduler policy trait, topology cost, reservation/backfill skeleton"
+license = "MIT"
+
+[dependencies]
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+zerocopy = { version = "0.8", features = ["derive"] }

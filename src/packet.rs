@@ -1,0 +1,104 @@
+use bytes::{BufMut, Bytes, BytesMut};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+use crate::ir::MergeMode;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct PacketHeader {
+    pub opcode_id: u16,
+    pub merge_mode: u16,
+    pub src_len: u16,
+    pub dst_len: u16,
+    pub payload_len: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct URPPacket {
+    raw: Bytes,
+}
+
+impl URPPacket {
+    pub fn build(opcode_id: u16, merge_mode: MergeMode, src_block: &str, dst_block: &str, payload: &[u8]) -> Self {
+        let src = src_block.as_bytes();
+        let dst = dst_block.as_bytes();
+        let header = PacketHeader {
+            opcode_id,
+            merge_mode: merge_mode as u16,
+            src_len: src.len() as u16,
+            dst_len: dst.len() as u16,
+            payload_len: payload.len() as u32,
+        };
+
+        let mut buf = BytesMut::with_capacity(
+            core::mem::size_of::<PacketHeader>() + src.len() + dst.len() + payload.len()
+        );
+        buf.put_slice(header.as_bytes());
+        buf.put_slice(src);
+        buf.put_slice(dst);
+        buf.put_slice(payload);
+
+        Self { raw: buf.freeze() }
+    }
+
+    pub fn header(&self) -> PacketHeader {
+        let hsize = core::mem::size_of::<PacketHeader>();
+        *PacketHeader::ref_from_bytes(&self.raw[..hsize]).expect("invalid packet header")
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        let h = self.header();
+        let base = core::mem::size_of::<PacketHeader>() + h.src_len as usize + h.dst_len as usize;
+        let end = base + h.payload_len as usize;
+        &self.raw[base..end]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PayloadValue {
+    I64(i64),
+    Str(String),
+}
+
+pub struct PayloadCodec;
+
+impl PayloadCodec {
+    const TYPE_I64: u8 = 1;
+    const TYPE_STR: u8 = 2;
+
+    pub fn encode(value: &PayloadValue) -> Vec<u8> {
+        match value {
+            PayloadValue::I64(v) => {
+                let mut out = Vec::with_capacity(9);
+                out.push(Self::TYPE_I64);
+                out.extend_from_slice(&v.to_le_bytes());
+                out
+            }
+            PayloadValue::Str(s) => {
+                let b = s.as_bytes();
+                let mut out = Vec::with_capacity(1 + 4 + b.len());
+                out.push(Self::TYPE_STR);
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(b);
+                out
+            }
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> PayloadValue {
+        match bytes[0] {
+            Self::TYPE_I64 => {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&bytes[1..9]);
+                PayloadValue::I64(i64::from_le_bytes(arr))
+            }
+            Self::TYPE_STR => {
+                let mut len = [0u8; 4];
+                len.copy_from_slice(&bytes[1..5]);
+                let n = u32::from_le_bytes(len) as usize;
+                PayloadValue::Str(String::from_utf8(bytes[5..5+n].to_vec()).expect("invalid utf8"))
+            }
+            _ => panic!("unknown payload type"),
+        }
+    }
+}
