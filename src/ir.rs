@@ -28,6 +28,31 @@ pub struct IRBlock {
     pub estimated_duration: u32,
 }
 
+impl IRBlock {
+    pub fn new(id: &str, opcode: Opcode) -> Self {
+        Self {
+            block_id: id.to_string(),
+            opcode,
+            inputs: Vec::new(),
+            output: String::new(),
+            required_tag: String::new(),
+            merge_mode: MergeMode::List,
+            resource_shape: String::new(),
+            preferred_zone: String::new(),
+            inertia_key: None,
+            estimated_duration: 1,
+        }
+    }
+
+    pub fn set_tag(&mut self, tag: &str) {
+        self.required_tag = tag.to_string();
+    }
+
+    pub fn set_merge_mode(&mut self, mode: MergeMode) {
+        self.merge_mode = mode;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IREdge {
     pub src_block: String,
@@ -44,6 +69,22 @@ pub struct IRGraph {
 }
 
 impl IRGraph {
+    pub fn new() -> Self {
+        Self {
+            graph_id: "default".to_string(),
+            blocks: Vec::new(),
+            edges: Vec::new(),
+        }
+    }
+
+    pub fn with_id(id: String) -> Self {
+        Self {
+            graph_id: id,
+            blocks: Vec::new(),
+            edges: Vec::new(),
+        }
+    }
+
     pub fn get_block(&self, id: &str) -> Option<&IRBlock> {
         self.blocks.iter().find(|b| b.block_id == id)
     }

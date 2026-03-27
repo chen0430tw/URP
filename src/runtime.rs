@@ -10,7 +10,7 @@ use crate::partition::bind_partitions;
 use crate::policy::SchedulerPolicy;
 use crate::reducer::run_reducers;
 use crate::remote::RemotePacketLink;
-use crate::reservation::{Reservation, ReservationTable};
+use crate::reservation::ReservationTable;
 use crate::ring::LocalRingTunnel;
 
 #[derive(Debug, Clone)]
@@ -29,6 +29,8 @@ pub struct BlockExecutionResult {
     pub block_id: String,
     pub partition_id: String,
     pub node_id: String,
+    pub start_time: u32,
+    pub end_time: u32,
     pub value: PayloadValue,
     pub merge_mode: MergeMode,
 }
@@ -43,6 +45,7 @@ pub struct RuntimeResult {
     pub packet_log: Vec<PacketLog>,
     pub merged: HashMap<String, String>,
     pub remote_sent_packets: usize,
+    pub outputs: Vec<PayloadValue>,
 }
 
 pub struct URXRuntime<P: SchedulerPolicy> {
@@ -115,12 +118,12 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
         let partition_binding = bind_partitions(&fused, &partitions, &self.nodes, &self.policy);
 
         for (pid, nid) in &partition_binding {
-            self.reservations.add(Reservation {
-                partition_id: pid.clone(),
-                node_id: nid.clone(),
-                start_time: 0,
-                end_time: 10,
-            });
+            self.reservations.add(crate::reservation::Reservation::new(
+                pid.clone(),
+                nid.clone(),
+                0,
+                10,
+            ));
         }
 
         let mut block_binding = HashMap::new();
@@ -155,6 +158,8 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
                 block_id: block.block_id.clone(),
                 partition_id: partitions.get(&block.block_id).unwrap().clone(),
                 node_id: node_id.clone(),
+                start_time: 0,
+                end_time: 0,
                 value: value.clone(),
                 merge_mode: block.merge_mode,
             });
@@ -179,7 +184,8 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
                     let recv = ring.pop().await;
                     PayloadCodec::decode(recv.payload())
                 } else {
-                    let recv = self.remote.send(packet).await;
+                    // TODO: Implement actual remote routing with node addresses
+                    let recv = self.remote.send_legacy(packet).await;
                     PayloadCodec::decode(recv.payload())
                 };
 
@@ -211,6 +217,7 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
             packet_log,
             merged: run_reducers(&grouped),
             remote_sent_packets: self.remote.sent_packets,
+            outputs: Vec::new(),
         }
     }
 }

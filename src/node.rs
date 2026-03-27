@@ -23,6 +23,20 @@ pub struct Node {
 }
 
 impl Node {
+    pub fn new(node_id: &str, node_type: NodeType, compute_capacity: f32) -> Self {
+        Self {
+            node_id: node_id.to_string(),
+            node_type,
+            host_id: "default".to_string(),
+            zone: "default".to_string(),
+            tags: Vec::new(),
+            compute_capacity,
+            memory_capacity: 1024.0,
+            bandwidth: 1000.0,
+            inertia_keys: Vec::new(),
+        }
+    }
+
     pub fn has_tag(&self, tag: &str) -> bool {
         self.tags.iter().any(|t| t == tag)
     }

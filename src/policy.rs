@@ -18,6 +18,14 @@ pub struct MultifactorPolicy {
     pub reservation_bias: f32,
 }
 
+impl MultifactorPolicy {
+    pub fn new() -> Self {
+        Self {
+            reservation_bias: 0.5,
+        }
+    }
+}
+
 impl SchedulerPolicy for MultifactorPolicy {
     fn select_partition_node(
         &self,

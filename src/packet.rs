@@ -52,6 +52,17 @@ impl URPPacket {
         let end = base + h.payload_len as usize;
         &self.raw[base..end]
     }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.raw.to_vec()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < core::mem::size_of::<PacketHeader>() {
+            return Err("Packet too short".to_string());
+        }
+        Ok(Self { raw: Bytes::copy_from_slice(bytes) })
+    }
 }
 
 #[derive(Debug, Clone)]

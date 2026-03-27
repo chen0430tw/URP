@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::ir::MergeMode;
-use crate::packet::PayloadValue;
+pub use crate::packet::PayloadValue;
 
 pub trait Reducer {
     fn merge(&self, values: &[PayloadValue]) -> String;
