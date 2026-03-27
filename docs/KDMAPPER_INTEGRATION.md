@@ -242,8 +242,134 @@ impl Node {
 
 ### 3. KDMapper FFI 模块
 
+**实现状态**: ✅ 已完成
+
+文件结构:
+```
+URP/
+├── src/
+│   └── kdmapper_ffi.rs        # Rust FFI 绑定 (已实现)
+├── kdmapper_cpp/
+│   ├── kdmapper_wrapper.hpp   # C++ 包装头文件 (已实现)
+│   ├── kdmapper_wrapper.cpp   # C++ 包装实现 (已实现)
+│   └── CMakeLists.txt         # 构建配置 (已实现)
+└── kdmapper/                  # 原始 KDMapper 项目
+    └── kdmapper/              # C++ 源代码
+```
+
+FFI 接口定义:
 ```rust
-// src/kdmapper.rs - 新增模块
+// src/kdmapper_ffi.rs
+
+/// KDMapper 执行器 - 主接口
+pub struct KDMapperExecutor {
+    handle: Option<KDMapperHandle>,
+    loaded_drivers: Vec<String>,
+    intel_driver_loaded: bool,
+}
+
+impl KDMapperExecutor {
+    // 初始化 Intel 驱动
+    pub fn initialize(&mut self, intel_driver_path: Option<&str>) -> Result<()>;
+
+    // 映射驱动到内核
+    pub fn map_driver(&mut self, config: DriverMappingConfig) -> Result<DriverMappingResult>;
+
+    // 读取内核内存
+    pub fn read_kernel_memory(&self, address: u64, size: usize) -> Result<Vec<u8>>;
+
+    // 写入内核内存
+    pub fn write_kernel_memory(&self, address: u64, data: &[u8]) -> Result<MemoryOperationResult>;
+
+    // 设置内核内存
+    pub fn set_kernel_memory(&self, address: u64, value: u32, size: u64) -> Result<()>;
+
+    // 分配内核内存池
+    pub fn allocate_kernel_pool(&self, pool_type: PoolType, size: u64) -> Result<u64>;
+
+    // 释放内核内存池
+    pub fn free_kernel_pool(&self, address: u64) -> Result<()>;
+
+    // 执行 Shellcode
+    pub fn execute_shellcode(&self, shellcode: &[u8], timeout_ms: u32) -> Result<u64>;
+
+    // 获取模块基址
+    pub fn get_module_base(&self, module_name: &str) -> Result<u64>;
+
+    // 获取模块导出地址
+    pub fn get_module_export(&self, module_base: u64, function_name: &str) -> Result<u64>;
+
+    // 清除痕迹
+    pub fn clear_unloaded_drivers(&self) -> Result<()>;
+}
+```
+
+C++ 包装接口:
+```cpp
+// kdmapper_cpp/kdmapper_wrapper.hpp
+
+// Intel 驱动管理
+bool kdmapper_is_running(void);
+KDMapperDevice* kdmapper_load_intel_driver(const char* driver_path);
+void kdmapper_unload_intel_driver(KDMapperDevice* handle);
+
+// 内存操作
+bool kdmapper_read_memory(KDMapperDevice* handle, uint64_t address, uint8_t* buffer, uint64_t size);
+bool kdmapper_write_memory(KDMapperDevice* handle, uint64_t address, const uint8_t* buffer, uint64_t size);
+bool kdmapper_set_memory(KDMapperDevice* handle, uint64_t address, uint32_t value, uint64_t size);
+
+// 内存池操作
+uint64_t kdmapper_allocate_pool(KDMapperDevice* handle, uint32_t pool_type, uint64_t size);
+bool kdmapper_free_pool(KDMapperDevice* handle, uint64_t address);
+
+// 驱动映射
+bool kdmapper_map_driver(KDMapperDevice* handle, const char* driver_path,
+                        uint64_t* out_base_address, uint64_t* out_image_size,
+                        uint64_t* out_entry_point, uint32_t* out_status);
+
+// Shellcode 执行
+bool kdmapper_execute_shellcode(KDMapperDevice* handle, const uint8_t* shellcode,
+                               uint32_t shellcode_size, uint32_t timeout_ms, uint64_t* out_result);
+
+// 模块信息
+uint64_t kdmapper_get_module_base(KDMapperDevice* handle, const char* module_name);
+uint64_t kdmapper_get_module_export(KDMapperDevice* handle, uint64_t module_base, const char* function_name);
+
+// 反取证
+bool kdmapper_clear_unloaded_drivers(KDMapperDevice* handle);
+```
+
+**使用示例**:
+```rust
+use urx_runtime_v08::kdmapper_ffi::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut executor = KDMapperExecutor::new();
+
+    // 初始化 Intel 驱动
+    executor.initialize(Some("iqvw64e.sys"))?;
+
+    // 映射驱动
+    let config = DriverMappingConfig {
+        driver_path: "C:\\path\\to\\driver.sys".to_string(),
+        ..Default::default()
+    };
+
+    let result = executor.map_driver(config)?;
+    println!("Driver mapped at 0x{:x}", result.base_address);
+
+    // 读取内核内存
+    let data = executor.read_kernel_memory(result.base_address, 0x100)?;
+    println!("Read {} bytes", data.len());
+
+    Ok(())
+}
+```
+
+---
+
+### 4. 内核感知调度策略 (TODO)
 
 //! KDMapper FFI Binding Layer
 //!
@@ -694,27 +820,27 @@ impl KernelBlockExecutor {
 ```
 URP/
 ├── src/
-│   ├── ir.rs              # 扩展 Opcode
-│   ├── node.rs            # 扩展 NodeType
-│   ├── kdmapper.rs        # 新增：KDMapper FFI
-│   ├── kernel_policy.rs   # 新增：内核感知调度
-│   ├── kernel_executor.rs # 新增：内核操作执行器
-│   └── ...
-├── kdmapper/              # 新增：KDMapper C++ 子模块
-│   ├── include/
-│   │   └── kdmapper.hpp
-│   ├── src/
-│   │   ├── driver.cpp
-│   │   ├── memory.cpp
-│   │   └── shellcode.cpp
-│   ├── CMakeLists.txt
-│   └── README.md
-├── tests/
-│   ├── kdmapper_test.rs   # 新增：KDMapper 测试
-│   └── ...
-└── docs/
-    └── KDMAPPER_INTEGRATION.md
+│   └── kdmapper_ffi.rs         # Rust FFI 绑定 ✅ 已实现
+├── kdmapper_cpp/               # C++ 包装层 ✅ 已实现
+│   ├── kdmapper_wrapper.hpp    # C 接口头文件
+│   ├── kdmapper_wrapper.cpp    # C++ 实现
+│   └── CMakeLists.txt          # 构建配置
+├── kdmapper/                   # 原始 KDMapper 项目
+│   └── kdmapper/               # C++ 源代码
+├── docs/
+│   └── KDMAPPER_INTEGRATION.md  # 本文档
+└── Cargo.toml                  # 添加 "kdmapper" 功能
 ```
+
+**实现进度**:
+- ✅ `src/kdmapper_ffi.rs` - Rust FFI 绑定层
+- ✅ `kdmapper_cpp/kdmapper_wrapper.hpp` - C++ 包装头文件
+- ✅ `kdmapper_cpp/kdmapper_wrapper.cpp` - C++ 包装实现
+- ✅ `kdmapper_cpp/CMakeLists.txt` - 构建配置
+- ⏳ `src/ir.rs` - 扩展内核操作码 (待实现)
+- ⏳ `src/node.rs` - 添加 Kernel 节点类型 (待实现)
+- ⏳ `src/kernel_policy.rs` - 内核感知调度 (待实现)
+- ⏳ `src/kernel_executor.rs` - 内核操作执行器 (待实现)
 
 ---
 

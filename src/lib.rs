@@ -54,6 +54,17 @@ pub mod runtime;
 pub mod scheduler;
 pub mod shared_memory;
 
+// KDMapper FFI module (optional, requires "kdmapper" feature)
+#[cfg(feature = "kdmapper")]
+pub mod kdmapper_ffi;
+
+// Re-export kdmapper types when feature is enabled
+#[cfg(feature = "kdmapper")]
+pub use kdmapper_ffi::{
+    DriverMappingConfig, DriverMappingResult, KDMapperError, KDMapperExecutor,
+    KernelModuleInfo, MemoryOperationResult, PoolType, Result,
+};
+
 // Re-export commonly used types
 pub use cost::{node_score, route_cost};
 pub use executor::BlockExecutor;
