@@ -39,6 +39,7 @@
 //! ```
 
 pub mod cost;
+pub mod et_cooling;
 #[cfg(feature = "gpu")]
 pub mod gpu_executor;
 pub mod executor;
@@ -77,6 +78,7 @@ pub use node::{Node, NodeType};
 pub use optimizer::{fuse_linear_blocks, partition_graph};
 pub use packet::{PayloadCodec, PayloadValue, URPPacket};
 pub use partition::bind_partitions;
+pub use et_cooling::{ETCoolingPolicy, ETWCNCooling, ETCoolingResult, symmetric_gap};
 pub use policy::{MultifactorPolicy, SchedulerPolicy};
 pub use reducer::{Reducer};
 pub use remote::{LinkConfig, RemotePacketLink};
