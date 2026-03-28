@@ -298,6 +298,84 @@ target_link_libraries(kdmapper_cpp
 // 替代静态链接 kdmapper_cpp.lib
 ```
 
+### 问题 5: GNU link.exe 被误用导致编译失败 + 运行时蓝屏
+
+**现象**：`cargo build` 报错 `extra operand '*.rcgu.o'`，且即使强行运行也会导致系统蓝屏。
+
+**根因**：Git 自带的 `C:\Program Files\Git\usr\bin\link.exe`（GNU 链接器）优先级高于 MSVC 的 `link.exe`，导致 Rust MSVC target 使用了错误的链接器。
+
+**为什么 GNU 编译结果会蓝屏**：
+
+| 问题 | 说明 |
+|------|------|
+| `.pdata` 段缺失 | GNU 链接器不生成符合 Windows PE 规范的 SEH unwind 表，异常展开时栈帧损坏 |
+| CRT 不匹配 | `kdmapper_cpp.dll`（MSVC 编译）与 GNU 可执行文件使用不同堆，`std::string` 跨模块传递导致堆损坏 |
+| 损坏的内核参数 | 栈/堆损坏后调用 `WriteMemory`/`CallKernelFunction` 时传入垃圾值，内核访问非法地址 → BSOD |
+
+**解决方案**：在 `.cargo/config.toml` 中显式指定 MSVC linker：
+
+```toml
+# URP/.cargo/config.toml
+[target.x86_64-pc-windows-msvc]
+linker = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"
+```
+
+同时确保 VS BuildTools 安装了 `VCTools` 工作负载（含 C++ 编译器和链接器）：
+
+```
+winget install --id Microsoft.VisualStudio.2022.BuildTools --source winget ^
+  --override "--add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --quiet --norestart"
+```
+
+> **注意**：winget 安装器会在后台继续下载 C++ 组件（约数百 MB），需等待所有 `setup.exe` 进程退出后才算完成。
+
+---
+
+## BSOD 根因分析（GNU 工具链）
+
+> 本节记录 2026-03-28 排查的蓝屏问题，供后续开发参考。
+
+### 问题链路
+
+```
+GNU link.exe 误用
+    │
+    ▼
+PE 二进制缺少 .pdata (SEH unwind 表)
+    │
+    ▼
+运行时异常无法正确展开 → 栈帧损坏
+    │
+    ▼
+kdmapper_cpp.dll 接收到损坏的参数
+    │
+    ▼
+intel_driver::WriteMemory / CallKernelFunction 写入垃圾地址
+    │
+    ▼
+内核访问非法内存 → BSOD (KERNEL_SECURITY_CHECK_FAILURE / ACCESS_VIOLATION)
+```
+
+### 判断 BSOD 来自编译还是驱动本身
+
+| 特征 | 编译问题导致 | 驱动本身 bug |
+|------|------------|-------------|
+| MSVC 编译后是否复现 | 否 | 是 |
+| 蓝屏发生时机 | 驱动加载/映射阶段 | 驱动运行期间 |
+| 错误码 | 通常为 AV / SECURITY_CHECK | 多样，取决于驱动逻辑 |
+| 可重现性 | 每次都蓝屏 | 可能偶发 |
+
+**本次蓝屏属于编译问题**：使用正确的 MSVC 工具链编译后问题消失。
+
+### 额外代码风险点（与工具链无关）
+
+`kdmapper_wrapper.cpp` 第 70 行返回 static 局部变量地址作为 handle：
+```cpp
+static KDMapperDevice dummy_handle;
+return &dummy_handle;  // handle 在 DLL 内部实际未使用
+```
+DLL 内部所有函数均使用全局 `g_device_handle`，Rust 侧传入的 handle 参数只做 null 检查，不影响功能，但需注意**不能对此 handle 做任何解引用操作**。
+
 ---
 
 ## 下一步工作 (可选)
@@ -313,5 +391,6 @@ target_link_libraries(kdmapper_cpp
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v1.1.0 | 2026-03-28 | 新增 GNU 工具链蓝屏根因分析，记录 MSVC linker 修复方案 |
 | v1.0.0 | 2026-03-28 | 实现完成，测试通过 |
 | v0.1.0 | 2026-03-27 | 初始设计 |
