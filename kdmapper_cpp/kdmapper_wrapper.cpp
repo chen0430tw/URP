@@ -255,9 +255,17 @@ bool kdmapper_map_driver(
     *out_image_size = nt_headers->OptionalHeader.SizeOfImage;
     *out_entry_point = base_address + nt_headers->OptionalHeader.AddressOfEntryPoint;
 
-    // Note: MapDriver doesn't return the actual NTSTATUS from DriverEntry
-    // For now, we set STATUS_SUCCESS (0x00000000)
+    // Note: MapDriver doesn't return the actual NTSTATUS from DriverEntry.
+    // Set STATUS_SUCCESS (0x00000000).
     *out_status = 0;
+
+    // Post-map cleanup: remove the Intel driver's entry from MmUnloadedDrivers.
+    // This reduces the forensic window that PatchGuard uses to detect manually
+    // mapped drivers. Done automatically so callers don't have to remember.
+    if (!intel_driver::ClearMmUnloadedDrivers(g_device_handle)) {
+        // Non-fatal: log but don't fail the mapping operation.
+        set_last_error("Warning: ClearMmUnloadedDrivers failed after successful map");
+    }
 
     return true;
 }

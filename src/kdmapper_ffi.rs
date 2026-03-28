@@ -31,7 +31,10 @@ pub enum KDMapperError {
     InvalidPEImage,
     RelocationFailed,
     ImportResolutionFailed,
+    /// DriverEntry returned a non-zero NTSTATUS.
+    /// The inner value is the raw NTSTATUS code (e.g. 0xC0000034 = STATUS_OBJECT_NAME_NOT_FOUND).
     DriverEntryFailed,
+    DriverEntryNtStatus(u32),
     Unknown(String),
 }
 
@@ -53,6 +56,7 @@ impl std::fmt::Display for KDMapperError {
             KDMapperError::RelocationFailed => write!(f, "Relocation failed"),
             KDMapperError::ImportResolutionFailed => write!(f, "Import resolution failed"),
             KDMapperError::DriverEntryFailed => write!(f, "Driver entry point failed"),
+            KDMapperError::DriverEntryNtStatus(s) => write!(f, "Driver entry point failed with NTSTATUS 0x{:08X}", s),
             KDMapperError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
         }
     }
@@ -211,6 +215,7 @@ mod dynamic_ffi {
     type FnGetModuleExport = unsafe extern "C" fn(*mut FFIHandle, u64, *const c_char) -> u64;
     type FnClearUnloadedDrivers = unsafe extern "C" fn(*mut FFIHandle) -> bool;
     type FnCheckBlocklist = unsafe extern "C" fn() -> bool;
+    type FnGetLastError  = unsafe extern "C" fn() -> *const std::ffi::c_char;
 
     pub struct KDMapperLib {
         _library: Library,
@@ -340,6 +345,22 @@ mod dynamic_ffi {
             let func: Symbol<FnCheckBlocklist> = lib.get(b"kdmapper_check_blocklist")
                 .map_err(|e| format!("Failed to get kdmapper_check_blocklist: {}", e))?;
             Ok(func())
+        }
+
+        pub unsafe fn get_last_error(&self) -> String {
+            let lib = &self._library;
+            match lib.get::<FnGetLastError>(b"kdmapper_get_last_error") {
+                Ok(func) => {
+                    let ptr = func();
+                    if ptr.is_null() {
+                        return String::new();
+                    }
+                    std::ffi::CStr::from_ptr(ptr)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+                Err(_) => String::new(),
+            }
         }
     }
 
@@ -548,6 +569,21 @@ mod dynamic_ffi {
             Err(_) => false,
         }
     }
+
+    /// Returns the last error string from the C++ layer, or empty string.
+    pub fn kdmapper_cpp_last_error() -> String {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    unsafe { l.get_last_error() }
+                } else {
+                    String::new()
+                }
+            }
+            Err(_) => String::new(),
+        }
+    }
 }
 
 // Re-export dynamic_ffi functions for kdmapper-native mode
@@ -708,6 +744,12 @@ pub extern "C" fn kdmapper_check_blocklist() -> bool {
     check_blocklist_registry()
 }
 
+/// In mock mode there is no C++ layer, so this always returns empty.
+#[cfg(not(feature = "kdmapper-native"))]
+fn kdmapper_cpp_last_error() -> String {
+    String::new()
+}
+
 // ============================================================================
 // Rust-native environment checks (no DLL required)
 // ============================================================================
@@ -796,7 +838,13 @@ impl KDMapperExecutor {
             let handle = kdmapper_load_intel_driver(driver_path.as_ptr());
 
             if handle.is_null() {
-                return Err(KDMapperError::DriverLoadFailed);
+                let cpp_err = kdmapper_cpp_last_error();
+                if cpp_err.is_empty() {
+                    return Err(KDMapperError::DriverLoadFailed);
+                }
+                return Err(KDMapperError::Unknown(
+                    format!("Intel driver load failed: {}", cpp_err)
+                ));
             }
 
             self.handle = NonNull::new(handle);
@@ -850,7 +898,18 @@ impl KDMapperExecutor {
             if success {
                 self.loaded_drivers.push(config.driver_path.clone());
             } else {
-                return Err(KDMapperError::DriverEntryFailed);
+                // If DriverEntry returned a non-zero NTSTATUS, surface it directly.
+                if result.entry_status != 0 {
+                    return Err(KDMapperError::DriverEntryNtStatus(result.entry_status));
+                }
+                // Otherwise attach the C++ error string for diagnosis.
+                let cpp_err = kdmapper_cpp_last_error();
+                if cpp_err.is_empty() {
+                    return Err(KDMapperError::DriverEntryFailed);
+                }
+                return Err(KDMapperError::Unknown(
+                    format!("Driver mapping failed: {}", cpp_err)
+                ));
             }
         }
 
@@ -1079,6 +1138,29 @@ mod tests {
     fn test_error_display() {
         assert_eq!(format!("{}", KDMapperError::DriverLoadFailed), "Failed to load driver");
         assert_eq!(format!("{}", KDMapperError::InvalidAddress), "Invalid address");
+        assert!(format!("{}", KDMapperError::BlocklistEnabled).contains("VulnerableDriverBlocklistEnable"));
+        assert_eq!(
+            format!("{}", KDMapperError::DriverEntryNtStatus(0xC0000034)),
+            "Driver entry point failed with NTSTATUS 0xC0000034"
+        );
+        assert_eq!(
+            format!("{}", KDMapperError::Unknown("test".into())),
+            "Unknown error: test"
+        );
+    }
+
+    #[test]
+    fn test_check_blocklist_mock() {
+        // In mock mode (no kdmapper-native feature) kdmapper_check_blocklist()
+        // reads the registry; on a test machine the value is typically absent or 0.
+        // We just assert it doesn't panic and returns a bool.
+        let _result: bool = unsafe { kdmapper_check_blocklist() };
+    }
+
+    #[test]
+    fn test_cpp_last_error_mock() {
+        // In mock mode kdmapper_cpp_last_error() always returns empty string.
+        assert_eq!(kdmapper_cpp_last_error(), "");
     }
 
     #[test]

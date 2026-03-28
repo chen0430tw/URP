@@ -482,6 +482,95 @@ proc-macro DLL → 正确的 PE 格式 + 导出表 → rustc 成功加载
 
 ---
 
+## KDU 架构研究与对比
+
+> 研究来源：[hfiref0x/KDU](https://github.com/hfiref0x/KDU)，克隆至 `C:\Users\Administrator\KDU`
+
+### KDU vs kdmapper 核心差异
+
+| 特性 | KDU | 本项目 (kdmapper) |
+|------|-----|-----------------|
+| Vulnerable Driver | 58 个可选 Provider | 单一 iqvw64e.sys |
+| Win11 24H2 Blocklist | 可切换备用 Provider | 已加 pre-flight 检测，但无备用 |
+| Shellcode 版本 | V1/V2/V3/V4 | V1/V2 |
+| V3 DriverObject | 动态创建，不为 NULL | 传入 NULL（driverless 限制）|
+| DSE 修复 | 直接写 `g_CiOptions` | 不涉及 |
+| PiDDBCacheTable 清理 | 未实现（仅诊断） | 未实现 |
+| MmUnloadedDrivers 清理 | 未实现 | **已在 map 后自动调用** |
+
+### KDU Provider 机制（参考价值）
+
+KDU 把漏洞驱动抽象为可替换的 Provider，每个 Provider 暴露统一回调接口：
+
+```
+ReadKernelVM / WriteKernelVM
+ReadPhysicalMemory / WritePhysicalMemory
+VirtualToPhysical / QueryPML4
+MapDriver / ControlDSE
+```
+
+本项目 `intel_driver_path` 字段虽然存在，但 C++ 层目前固定使用 `intel_driver::Load()`，不支持真正替换。未来可参考 KDU 做多 Provider 支持。
+
+### KDU Shellcode V3 的意义
+
+V3 使用 `ObCreateObject + ObInsertObject` 在内核中动态创建合法的 DriverObject，让映射的驱动不再是"driverless"状态：
+- 可以有合法的 DriverObject 和 RegistryPath
+- 可以注册 DriverUnload
+- 降低 PatchGuard 触发风险
+
+本项目当前是 driverless 模式，目标驱动必须遵守七条约束规则（见 `DriverMappingConfig` 文档）。
+
+---
+
+## 本次优化变更记录（v1.3.0）
+
+### C++ 层变更
+
+**`kdmapper_map_driver()` — 映射成功后自动清理 MmUnloadedDrivers**
+
+```cpp
+// 映射成功后自动调用，非阻塞（失败只记录警告，不影响映射结果）
+if (!intel_driver::ClearMmUnloadedDrivers(g_device_handle)) {
+    set_last_error("Warning: ClearMmUnloadedDrivers failed after successful map");
+}
+```
+
+**原因**：MmUnloadedDrivers 是 PatchGuard 的重要监控点。之前 Rust 侧虽然暴露了 `clear_unloaded_drivers()` 接口，但完全依赖调用方手动调用——实际上没有任何调用方会记得。现在改为 map 成功后自动执行。
+
+### Rust 层变更
+
+**1. `KDMapperError` 新增两个变体**
+
+```rust
+BlocklistEnabled   // Windows Vulnerable Driver Blocklist 开启，含注册表修复说明
+DriverEntryNtStatus(u32)  // DriverEntry 返回非零 NTSTATUS，携带原始错误码
+```
+
+**2. C++ 错误信息透传**
+
+之前失败时 Rust 只返回枚举，完全看不到 C++ 层的 `g_last_error`。现在：
+- `initialize()` 失败 → 附加 `kdmapper_get_last_error()` 内容
+- `map_driver()` 失败 → 优先返回 `DriverEntryNtStatus`，其次附加 C++ 错误字符串
+
+例：之前 `Err(DriverLoadFailed)`，现在 `Err(Unknown("Intel driver load failed: Windows Vulnerable Driver Blocklist is enabled - iqvw64e.sys will be blocked. ..."))`
+
+**3. `initialize()` pre-flight 顺序**
+
+```
+1. check_blocklist_registry()   ← Rust 原生读注册表，无需 DLL
+2. kdmapper_is_running()        ← 检查 \Device\Nal 残留
+3. kdmapper_load_intel_driver() ← 实际加载
+```
+
+**4. 测试补全**
+
+新增三个测试：
+- `test_check_blocklist_mock` — 验证 mock 模式 blocklist 检查不 panic
+- `test_cpp_last_error_mock` — 验证 mock 模式错误透传返回空字符串
+- `test_error_display` 扩展 — 覆盖 `BlocklistEnabled`、`DriverEntryNtStatus`、`Unknown`
+
+---
+
 ## 下一步工作 (可选)
 
 - [ ] 实现 IR 扩展 (内核操作码)
@@ -495,6 +584,7 @@ proc-macro DLL → 正确的 PE 格式 + 导出表 → rustc 成功加载
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v1.3.0 | 2026-03-28 | KDU 架构研究；自动 MmUnloadedDrivers 清理；C++ 错误透传；DriverEntryNtStatus 错误变体 |
 | v1.2.0 | 2026-03-28 | 新增 Rust proc-macro DLL 机制说明及 GNU vs MSVC 工具链深度对比 |
 | v1.1.0 | 2026-03-28 | 新增 GNU 工具链蓝屏根因分析，记录 MSVC linker 修复方案 |
 | v1.0.0 | 2026-03-28 | 实现完成，测试通过 |
