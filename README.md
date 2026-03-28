@@ -194,6 +194,9 @@ rt.set_et_policy(ETCoolingPolicy::new(ETWCNCooling::default()));
 
 ### USB 设备发现与执行（feature="usb"）
 
+> **注意**：需要 CDC ACM 串口类设备（如烧录了 urp-pico 固件的 Raspberry Pi Pico）。
+> 普通 U 盘（MSC 存储类，挂载为盘符）不会出现在串口列表中，无法被识别。
+
 ```rust
 #[cfg(feature = "usb")]
 {
