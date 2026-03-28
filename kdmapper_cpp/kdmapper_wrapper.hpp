@@ -8,6 +8,13 @@
 #include <Windows.h>
 #include <cstdint>
 
+// Export macro: dllexport when building the DLL, dllimport when consuming it
+#ifdef KDMAPPER_CPP_EXPORTS
+#  define KDMAPPER_API __declspec(dllexport)
+#else
+#  define KDMAPPER_API __declspec(dllimport)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -27,16 +34,16 @@ typedef struct KDMapperDevice_t {
 
 /// Check if the Intel driver is already running
 /// @return true if driver is running, false otherwise
-bool kdmapper_is_running(void);
+KDMAPPER_API bool kdmapper_is_running(void);
 
 /// Load the Intel vulnerable driver (iqvw64e.sys)
 /// @param driver_path Path to the Intel driver (can be NULL for default)
 /// @return Handle to the device, or NULL on failure
-KDMapperDevice* kdmapper_load_intel_driver(const char* driver_path);
+KDMAPPER_API KDMapperDevice* kdmapper_load_intel_driver(const char* driver_path);
 
 /// Unload the Intel driver
 /// @param handle Device handle from kdmapper_load_intel_driver
-void kdmapper_unload_intel_driver(KDMapperDevice* handle);
+KDMAPPER_API void kdmapper_unload_intel_driver(KDMapperDevice* handle);
 
 // ============================================================================
 // Memory Operations
@@ -48,7 +55,7 @@ void kdmapper_unload_intel_driver(KDMapperDevice* handle);
 /// @param buffer Output buffer
 /// @param size Number of bytes to read
 /// @return true on success, false on failure
-bool kdmapper_read_memory(
+KDMAPPER_API bool kdmapper_read_memory(
     KDMapperDevice* handle,
     uint64_t address,
     uint8_t* buffer,
@@ -61,7 +68,7 @@ bool kdmapper_read_memory(
 /// @param buffer Input buffer
 /// @param size Number of bytes to write
 /// @return true on success, false on failure
-bool kdmapper_write_memory(
+KDMAPPER_API bool kdmapper_write_memory(
     KDMapperDevice* handle,
     uint64_t address,
     const uint8_t* buffer,
@@ -74,7 +81,7 @@ bool kdmapper_write_memory(
 /// @param value Value to set (32-bit)
 /// @param size Number of bytes to set
 /// @return true on success, false on failure
-bool kdmapper_set_memory(
+KDMAPPER_API bool kdmapper_set_memory(
     KDMapperDevice* handle,
     uint64_t address,
     uint32_t value,
@@ -90,7 +97,7 @@ bool kdmapper_set_memory(
 /// @param pool_type Pool type (0=NonPagedPool, 2=PagedPool, etc.)
 /// @param size Size in bytes
 /// @return Kernel virtual address, or 0 on failure
-uint64_t kdmapper_allocate_pool(
+KDMAPPER_API uint64_t kdmapper_allocate_pool(
     KDMapperDevice* handle,
     uint32_t pool_type,
     uint64_t size
@@ -100,7 +107,7 @@ uint64_t kdmapper_allocate_pool(
 /// @param handle Device handle
 /// @param address Kernel virtual address to free
 /// @return true on success, false on failure
-bool kdmapper_free_pool(
+KDMAPPER_API bool kdmapper_free_pool(
     KDMapperDevice* handle,
     uint64_t address
 );
@@ -117,7 +124,7 @@ bool kdmapper_free_pool(
 /// @param out_entry_point Output: entry point address
 /// @param out_status Output: DriverEntry return status (NTSTATUS)
 /// @return true on success, false on failure
-bool kdmapper_map_driver(
+KDMAPPER_API bool kdmapper_map_driver(
     KDMapperDevice* handle,
     const char* driver_path,
     uint64_t* out_base_address,
@@ -137,7 +144,7 @@ bool kdmapper_map_driver(
 /// @param timeout_ms Timeout in milliseconds
 /// @param out_result Output: return value from shellcode
 /// @return true on success, false on failure
-bool kdmapper_execute_shellcode(
+KDMAPPER_API bool kdmapper_execute_shellcode(
     KDMapperDevice* handle,
     const uint8_t* shellcode,
     uint32_t shellcode_size,
@@ -153,7 +160,7 @@ bool kdmapper_execute_shellcode(
 /// @param handle Device handle
 /// @param module_name Name of the module (e.g., "ntoskrnl.exe")
 /// @return Base address, or 0 if not found
-uint64_t kdmapper_get_module_base(
+KDMAPPER_API uint64_t kdmapper_get_module_base(
     KDMapperDevice* handle,
     const char* module_name
 );
@@ -163,7 +170,7 @@ uint64_t kdmapper_get_module_base(
 /// @param module_base Base address of the module
 /// @param function_name Name of the exported function
 /// @return Function address, or 0 if not found
-uint64_t kdmapper_get_module_export(
+KDMAPPER_API uint64_t kdmapper_get_module_export(
     KDMapperDevice* handle,
     uint64_t module_base,
     const char* function_name
@@ -176,7 +183,7 @@ uint64_t kdmapper_get_module_export(
 /// Clear the MmUnloadedDrivers list (hide traces of loaded drivers)
 /// @param handle Device handle
 /// @return true on success, false on failure
-bool kdmapper_clear_unloaded_drivers(KDMapperDevice* handle);
+KDMAPPER_API bool kdmapper_clear_unloaded_drivers(KDMapperDevice* handle);
 
 // ============================================================================
 // Environment Validation
@@ -193,7 +200,7 @@ bool kdmapper_clear_unloaded_drivers(KDMapperDevice* handle);
 /// sufficient due to Windows Fast Startup caching the setting.
 ///
 /// @return true if blocklist is enabled (loading will fail), false if safe to proceed
-bool kdmapper_check_blocklist(void);
+KDMAPPER_API bool kdmapper_check_blocklist(void);
 
 // ============================================================================
 // Utility Functions
@@ -201,7 +208,7 @@ bool kdmapper_check_blocklist(void);
 
 /// Get the last error message (call after a failure)
 /// @return Error message string (valid until next call)
-const char* kdmapper_get_last_error(void);
+KDMAPPER_API const char* kdmapper_get_last_error(void);
 
 #ifdef __cplusplus
 }

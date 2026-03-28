@@ -45,6 +45,7 @@ if(WIN32)
         _UNICODE
         UNICODE
         DISABLE_OUTPUT
+        KDMAPPER_CPP_EXPORTS
     )
 
     # Link Windows libraries
