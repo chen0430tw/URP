@@ -151,20 +151,22 @@ async fn test_dag_dependency_chain() {
 
     let mut graph = IRGraph::with_id("dag-chain".to_string());
 
-    let mut const_a = block("const_a", Opcode::UConstI64(10), "cpu", "zone-a", "small");
+    // leaf 节点用 "leaf" shape，compute 节点用 "compute" shape
+    // 避免 fuse_linear_blocks 把相邻的 const_b 和 add 误融合（融合会丢弃 const_b→add 边）
+    let mut const_a = block("const_a", Opcode::UConstI64(10), "cpu", "zone-a", "leaf");
     const_a.merge_mode = MergeMode::Sum;
 
-    let mut const_b = block("const_b", Opcode::UConstI64(20), "cpu", "zone-a", "small");
+    let mut const_b = block("const_b", Opcode::UConstI64(20), "cpu", "zone-a", "leaf");
     const_b.merge_mode = MergeMode::Sum;
 
-    let mut add = block("add", Opcode::UAdd, "cpu", "zone-a", "small");
+    let mut add = block("add", Opcode::UAdd, "cpu", "zone-a", "compute");
     add.inputs = vec!["a".to_string(), "b".to_string()];
     add.merge_mode = MergeMode::Sum;
 
-    let mut suffix = block("suffix", Opcode::UConstStr("!".to_string()), "cpu", "zone-a", "small");
+    let mut suffix = block("suffix", Opcode::UConstStr("!".to_string()), "cpu", "zone-a", "leaf");
     suffix.merge_mode = MergeMode::Concat;
 
-    let mut concat = block("concat", Opcode::UConcat, "cpu", "zone-a", "small");
+    let mut concat = block("concat", Opcode::UConcat, "cpu", "zone-a", "compute");
     concat.inputs = vec!["left".to_string(), "right".to_string()];
     concat.merge_mode = MergeMode::Concat;
 
