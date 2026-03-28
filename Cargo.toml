@@ -19,6 +19,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 wgpu = { version = "29", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.3", optional = true }
+serialport = { version = "4", optional = true }
 
 [features]
 default = []
@@ -28,6 +29,8 @@ kdmapper = []
 kdmapper-native = ["kdmapper", "libloading"]
 # GPU compute via wgpu
 gpu = ["wgpu", "bytemuck", "pollster"]
+# USB device executor (serialport-backed + protocol framing)
+usb = ["serialport"]
 
 [dev-dependencies]
 tokio-test = "0.4"

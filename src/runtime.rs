@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cost::route_cost;
+use crate::et_cooling::ETCoolingPolicy;
 use crate::executor::{eval_opcode, ExecutorRegistry};
 use crate::ir::{IRGraph, MergeMode};
 use crate::node::Node;
@@ -57,6 +58,10 @@ pub struct URXRuntime<P: SchedulerPolicy> {
     reservations: ReservationTable,
     policy: P,
     pub executors: ExecutorRegistry,
+    /// Optional ET-WCN global scheduling optimizer.
+    /// When set, replaces the default `bind_partitions` with a simulated-annealing
+    /// search over partition→node assignments.
+    et_policy: Option<ETCoolingPolicy>,
 }
 
 impl<P: SchedulerPolicy> URXRuntime<P> {
@@ -69,7 +74,13 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
             reservations: ReservationTable::default(),
             policy,
             executors: ExecutorRegistry::new(),
+            et_policy: None,
         }
+    }
+
+    /// Enable ET-WCN cooling as the global partition-to-node optimizer.
+    pub fn set_et_policy(&mut self, p: ETCoolingPolicy) {
+        self.et_policy = Some(p);
     }
 
     fn ensure_ring(&mut self, src: &str, dst: &str) {
@@ -121,7 +132,11 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
     pub async fn execute_graph(&mut self, graph: &IRGraph) -> RuntimeResult {
         let fused = fuse_linear_blocks(graph);
         let partitions = partition_graph(&fused);
-        let partition_binding = bind_partitions(&fused, &partitions, &self.nodes, &self.policy);
+        let partition_binding = if let Some(ref et) = self.et_policy {
+            et.optimise_binding(&fused, &partitions, &self.nodes)
+        } else {
+            bind_partitions(&fused, &partitions, &self.nodes, &self.policy)
+        };
 
         for (pid, nid) in &partition_binding {
             self.reservations.add(crate::reservation::Reservation::new(

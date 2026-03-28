@@ -2,6 +2,8 @@ mod node;
 mod ir;
 mod optimizer;
 mod cost;
+mod et_cooling;
+mod usb_executor;
 mod partition;
 mod policy;
 mod reservation;

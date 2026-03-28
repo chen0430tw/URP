@@ -7,6 +7,9 @@ pub enum NodeType {
     Network,
     Rule,
     Structure,
+    /// USB-connected device (microcontroller, accelerator, etc.)
+    /// URP routes packets to it via the UsbExecutor transport.
+    Usb,
 }
 
 #[derive(Debug, Clone)]

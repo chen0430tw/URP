@@ -43,6 +43,8 @@ pub mod et_cooling;
 #[cfg(feature = "gpu")]
 pub mod gpu_executor;
 pub mod executor;
+pub mod jit_compiler;
+pub mod usb_executor;
 pub mod ir;
 pub mod node;
 pub mod optimizer;
@@ -79,6 +81,16 @@ pub use optimizer::{fuse_linear_blocks, partition_graph};
 pub use packet::{PayloadCodec, PayloadValue, URPPacket};
 pub use partition::bind_partitions;
 pub use et_cooling::{ETCoolingPolicy, ETWCNCooling, ETCoolingResult, symmetric_gap};
+pub use usb_executor::{
+    DeviceInfo, UsbLoopbackExecutor, UsbOpcodeId, UsbCpuFallbackExecutor,
+    encode_request, encode_response, decode_response, crc8,
+    FRAME_SYNC, STATUS_OK, STATUS_UNSUPPORTED, STATUS_ERROR,
+};
+#[cfg(feature = "usb")]
+pub use usb_executor::{UsbExecutor, UsbDeviceConfig, UsbDiscovery};
+pub use jit_compiler::{compile_graph, CompiledGraph, ShaderType};
+#[cfg(feature = "gpu")]
+pub use jit_compiler::JitExecutor;
 pub use policy::{MultifactorPolicy, SchedulerPolicy};
 pub use reducer::{Reducer};
 pub use remote::{LinkConfig, RemotePacketLink};
