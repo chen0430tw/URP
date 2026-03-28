@@ -121,6 +121,23 @@ impl PayloadCodec {
                 let n = u32::from_le_bytes(len) as usize;
                 PayloadValue::Str(String::from_utf8(bytes[5..5+n].to_vec()).expect("invalid utf8"))
             }
+            3 => {
+                // TYPE_LIST: u32(count) | (u32(len) | bytes)...
+                let mut count_arr = [0u8; 4];
+                count_arr.copy_from_slice(&bytes[1..5]);
+                let count = u32::from_le_bytes(count_arr) as usize;
+                let mut items = Vec::with_capacity(count);
+                let mut pos = 5usize;
+                for _ in 0..count {
+                    let mut len_arr = [0u8; 4];
+                    len_arr.copy_from_slice(&bytes[pos..pos+4]);
+                    let item_len = u32::from_le_bytes(len_arr) as usize;
+                    pos += 4;
+                    items.push(Self::decode(&bytes[pos..pos+item_len]));
+                    pos += item_len;
+                }
+                PayloadValue::List(items)
+            }
             _ => panic!("unknown payload type"),
         }
     }

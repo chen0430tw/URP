@@ -168,7 +168,7 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
                     let bid = block_id.clone();
                     let exec_name = executor.name().to_string();
                     tokio::task::spawn_blocking(move || {
-                        let value = eval_opcode(&block, &ctx);
+                        let value = executor.exec(&block, &ctx);
                         (bid, value, exec_name)
                     })
                 }).collect();
