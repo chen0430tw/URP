@@ -19,6 +19,7 @@ use std::ptr::NonNull;
 pub enum KDMapperError {
     DriverLoadFailed,
     DriverAlreadyRunning,
+    BlocklistEnabled,
     InvalidDriverPath,
     MemoryAllocationFailed,
     MemoryReadFailed,
@@ -39,6 +40,7 @@ impl std::fmt::Display for KDMapperError {
         match self {
             KDMapperError::DriverLoadFailed => write!(f, "Failed to load driver"),
             KDMapperError::DriverAlreadyRunning => write!(f, "Driver already running"),
+            KDMapperError::BlocklistEnabled => write!(f, "Windows Vulnerable Driver Blocklist is enabled; set VulnerableDriverBlocklistEnable=0 in HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Config then fully power off and restart"),
             KDMapperError::InvalidDriverPath => write!(f, "Invalid driver path"),
             KDMapperError::MemoryAllocationFailed => write!(f, "Memory allocation failed"),
             KDMapperError::MemoryReadFailed => write!(f, "Memory read failed"),
@@ -73,18 +75,37 @@ pub enum PoolType {
 }
 
 /// Driver mapping configuration
+///
+/// # Driverless Driver Requirements
+///
+/// Drivers loaded via kdmapper run outside the normal Windows driver model.
+/// They are NOT registered in `PsLoadedModulesList`, so PatchGuard actively
+/// monitors them. Violating any of the rules below causes BSOD (usually 0x109
+/// `CRITICAL_STRUCTURE_CORRUPTION` or 0x139 `KERNEL_SECURITY_CHECK_FAILURE`):
+///
+/// | Rule | Reason |
+/// |------|--------|
+/// | `DriverEntry` must return immediately | PatchGuard scans during prolonged execution |
+/// | No `DriverObject` / `RegistryPath` access | Both are `NULL` when loaded via kdmapper |
+/// | No kernel callback registration | Callbacks (PsSetCreateProcessNotifyRoutine, ObRegisterCallbacks …) point outside `PsLoadedModulesList` → BSOD 0x109 |
+/// | No SEH (`__try`/`__except`) | Mapped image lacks an exception directory |
+/// | No `DriverUnload` | Not supported; cleanup must be manual |
+/// | Long-running work → system thread | Use `PsCreateSystemThread`; never block in `DriverEntry` |
 #[derive(Debug, Clone)]
 pub struct DriverMappingConfig {
-    /// Path to the target driver (.sys file)
+    /// Path to the target driver (.sys file).
+    /// The driver must follow the driverless conventions described above.
     pub driver_path: String,
 
-    /// Path to the Intel vulnerable driver (default: "iqvw64e.sys")
+    /// Path to the Intel vulnerable driver (default: "iqvw64e.sys").
+    /// On Windows 11 24H2+ this driver may be blocked by the Vulnerable Driver
+    /// Blocklist. Check `KDMapperExecutor::initialize` for the pre-flight error.
     pub intel_driver_path: String,
 
     /// Custom initialization shellcode
     pub init_shellcode: Option<Vec<u8>>,
 
-    /// Erase PE headers after loading
+    /// Erase PE headers after loading to reduce forensic visibility
     pub erase_headers: bool,
 
     /// Timeout in milliseconds
@@ -189,6 +210,7 @@ mod dynamic_ffi {
     type FnGetModuleBase = unsafe extern "C" fn(*mut FFIHandle, *const c_char) -> u64;
     type FnGetModuleExport = unsafe extern "C" fn(*mut FFIHandle, u64, *const c_char) -> u64;
     type FnClearUnloadedDrivers = unsafe extern "C" fn(*mut FFIHandle) -> bool;
+    type FnCheckBlocklist = unsafe extern "C" fn() -> bool;
 
     pub struct KDMapperLib {
         _library: Library,
@@ -311,6 +333,13 @@ mod dynamic_ffi {
             let func: Symbol<FnClearUnloadedDrivers> = lib.get(b"kdmapper_clear_unloaded_drivers")
                 .map_err(|e| format!("Failed to get kdmapper_clear_unloaded_drivers: {}", e))?;
             Ok(func(handle))
+        }
+
+        pub unsafe fn check_blocklist(&self) -> Result<bool, String> {
+            let lib = &self._library;
+            let func: Symbol<FnCheckBlocklist> = lib.get(b"kdmapper_check_blocklist")
+                .map_err(|e| format!("Failed to get kdmapper_check_blocklist: {}", e))?;
+            Ok(func())
         }
     }
 
@@ -505,6 +534,20 @@ mod dynamic_ffi {
             Err(_) => false,
         }
     }
+
+    pub unsafe fn kdmapper_check_blocklist() -> bool {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.check_blocklist().unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 // Re-export dynamic_ffi functions for kdmapper-native mode
@@ -534,6 +577,8 @@ pub use dynamic_ffi::kdmapper_get_module_base;
 pub use dynamic_ffi::kdmapper_get_module_export;
 #[cfg(feature = "kdmapper-native")]
 pub use dynamic_ffi::kdmapper_clear_unloaded_drivers;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_check_blocklist;
 
 // Mock implementations for when kdmapper-native is NOT enabled
 // These are Rust functions that replace the C++ library for testing
@@ -655,6 +700,60 @@ pub extern "C" fn kdmapper_clear_unloaded_drivers(_handle: *mut FFIHandle) -> bo
     false
 }
 
+/// Mock-mode blocklist check: reads the registry directly in Rust so the
+/// check works even without kdmapper_cpp.dll loaded.
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_check_blocklist() -> bool {
+    check_blocklist_registry()
+}
+
+// ============================================================================
+// Rust-native environment checks (no DLL required)
+// ============================================================================
+
+/// Read VulnerableDriverBlocklistEnable from the registry using raw Win32 FFI.
+/// Returns true if the blocklist is enabled (iqvw64e.sys will be rejected).
+#[cfg(target_os = "windows")]
+fn check_blocklist_registry() -> bool {
+    #[link(name = "Advapi32")]
+    extern "system" {
+        fn RegOpenKeyExA(hkey: isize, subkey: *const u8, options: u32, desired: u32, result: *mut isize) -> i32;
+        fn RegQueryValueExA(hkey: isize, value: *const u8, reserved: *mut u32, reg_type: *mut u32, data: *mut u8, data_len: *mut u32) -> i32;
+        fn RegCloseKey(hkey: isize) -> i32;
+    }
+    const HKLM: isize = -2147483646_i64 as isize; // 0x80000002
+    const KEY_READ: u32 = 0x20019;
+
+    let subkey  = b"SYSTEM\\CurrentControlSet\\Control\\CI\\Config\0";
+    let valname = b"VulnerableDriverBlocklistEnable\0";
+
+    unsafe {
+        let mut hkey: isize = 0;
+        if RegOpenKeyExA(HKLM, subkey.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return false; // key absent → blocklist not configured
+        }
+        let mut value: u32 = 0;
+        let mut size: u32  = std::mem::size_of::<u32>() as u32;
+        let mut kind: u32  = 0;
+        let ret = RegQueryValueExA(
+            hkey,
+            valname.as_ptr(),
+            std::ptr::null_mut(),
+            &mut kind,
+            &mut value as *mut u32 as *mut u8,
+            &mut size,
+        );
+        RegCloseKey(hkey);
+        ret == 0 && value != 0
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn check_blocklist_registry() -> bool {
+    false // non-Windows: no blocklist
+}
+
 // ============================================================================
 // KDMapperExecutor Implementation
 // ============================================================================
@@ -673,6 +772,13 @@ impl KDMapperExecutor {
     pub fn initialize(&mut self, intel_driver_path: Option<&str>) -> Result<()> {
         if self.intel_driver_loaded {
             return Ok(());
+        }
+
+        // Pre-flight: Windows Vulnerable Driver Blocklist check.
+        // On Win11 24H2+ this blocks iqvw64e.sys with STATUS_IMAGE_CERT_REVOKED.
+        // We check in Rust so we get a clear error even without the DLL loaded.
+        if check_blocklist_registry() {
+            return Err(KDMapperError::BlocklistEnabled);
         }
 
         // Check if already running

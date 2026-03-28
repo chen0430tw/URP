@@ -49,6 +49,18 @@ KDMapperDevice* kdmapper_load_intel_driver(const char* driver_path) {
         return nullptr;
     }
 
+    // Fail early if the Windows Vulnerable Driver Blocklist will reject iqvw64e.sys.
+    // On Windows 11 24H2+ this is enabled by default and causes STATUS_IMAGE_CERT_REVOKED.
+    if (kdmapper_check_blocklist()) {
+        set_last_error(
+            "Windows Vulnerable Driver Blocklist is enabled - iqvw64e.sys will be blocked. "
+            "Disable: HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Config -> "
+            "VulnerableDriverBlocklistEnable = 0, then fully power off and restart "
+            "(not just Restart - Fast Startup caches the old setting)."
+        );
+        return nullptr;
+    }
+
     std::string driver_path_str = driver_path ? driver_path : "iqvw64e.sys";
 
     // Check if driver exists
@@ -369,6 +381,43 @@ bool kdmapper_clear_unloaded_drivers(KDMapperDevice* handle) {
     }
 
     return intel_driver::ClearMmUnloadedDrivers(g_device_handle);
+}
+
+// ============================================================================
+// Environment Validation
+// ============================================================================
+
+bool kdmapper_check_blocklist(void) {
+    HKEY hKey = nullptr;
+    LONG result = RegOpenKeyExA(
+        HKEY_LOCAL_MACHINE,
+        "SYSTEM\\CurrentControlSet\\Control\\CI\\Config",
+        0,
+        KEY_READ,
+        &hKey
+    );
+    if (result != ERROR_SUCCESS) {
+        // Key absent means the blocklist is not configured - safe to proceed.
+        return false;
+    }
+
+    DWORD value = 0;
+    DWORD size  = sizeof(DWORD);
+    DWORD type  = REG_DWORD;
+    result = RegQueryValueExA(
+        hKey,
+        "VulnerableDriverBlocklistEnable",
+        nullptr,
+        &type,
+        reinterpret_cast<LPBYTE>(&value),
+        &size
+    );
+    RegCloseKey(hKey);
+
+    if (result != ERROR_SUCCESS) {
+        return false;
+    }
+    return value != 0;
 }
 
 // ============================================================================

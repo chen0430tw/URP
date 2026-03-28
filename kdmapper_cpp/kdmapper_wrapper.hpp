@@ -179,6 +179,23 @@ uint64_t kdmapper_get_module_export(
 bool kdmapper_clear_unloaded_drivers(KDMapperDevice* handle);
 
 // ============================================================================
+// Environment Validation
+// ============================================================================
+
+/// Check if the Windows Vulnerable Driver Blocklist is enabled.
+/// Must be called before kdmapper_load_intel_driver.
+/// When enabled, Windows will block iqvw64e.sys with STATUS_IMAGE_CERT_REVOKED.
+///
+/// To disable:
+///   HKLM\SYSTEM\CurrentControlSet\Control\CI\Config
+///   -> VulnerableDriverBlocklistEnable = DWORD 0
+/// Then fully shut down (power off) and restart. A simple restart is NOT
+/// sufficient due to Windows Fast Startup caching the setting.
+///
+/// @return true if blocklist is enabled (loading will fail), false if safe to proceed
+bool kdmapper_check_blocklist(void);
+
+// ============================================================================
 // Utility Functions
 // ============================================================================
 
