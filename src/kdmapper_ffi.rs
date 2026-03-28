@@ -615,6 +615,8 @@ pub use dynamic_ffi::kdmapper_get_module_export;
 pub use dynamic_ffi::kdmapper_clear_unloaded_drivers;
 #[cfg(feature = "kdmapper-native")]
 pub use dynamic_ffi::kdmapper_check_blocklist;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_cpp_last_error;
 
 // Mock implementations for when kdmapper-native is NOT enabled
 // These are Rust functions that replace the C++ library for testing
