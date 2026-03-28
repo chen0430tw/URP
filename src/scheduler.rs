@@ -154,6 +154,7 @@ impl AsyncLane {
             end_time: 0,
             value: crate::reducer::PayloadValue::I64(0),
             merge_mode: MergeMode::List,
+            executor_name: "cpu".to_string(),
         })
     }
 }

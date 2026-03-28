@@ -67,7 +67,7 @@ pub use kdmapper_ffi::{
 
 // Re-export commonly used types
 pub use cost::{node_score, route_cost};
-pub use executor::BlockExecutor;
+pub use executor::{BlockExecutor, CpuExecutor, eval_opcode, ExecutorRegistry, HardwareExecutor, ThreadPoolExecutor};
 pub use ir::{IRBlock, IREdge, IRGraph, MergeMode, Opcode};
 pub use node::{Node, NodeType};
 pub use optimizer::{fuse_linear_blocks, partition_graph};
