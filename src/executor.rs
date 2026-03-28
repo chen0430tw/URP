@@ -121,29 +121,88 @@ impl BlockExecutor {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn eval_opcode(block: &IRBlock, ctx: &HashMap<String, PayloadValue>) -> PayloadValue {
+    // Helper: resolve a named input as i64
+    let i64_in = |name: &str| -> i64 {
+        match ctx.get(name).unwrap_or_else(|| panic!("missing input '{name}'")) {
+            PayloadValue::I64(v) => *v,
+            other => panic!("input '{name}' expected i64, got {other:?}"),
+        }
+    };
+
     match &block.opcode {
+        // ── Constants ────────────────────────────────────────────────
         Opcode::UConstI64(v) => PayloadValue::I64(*v),
         Opcode::UConstStr(s) => PayloadValue::Str(s.clone()),
+
+        // ── Batch 1: Arithmetic ───────────────────────────────────────
         Opcode::UAdd => {
-            let a = ctx.get(&block.inputs[0]).expect("missing input a");
-            let b = ctx.get(&block.inputs[1]).expect("missing input b");
-            match (a, b) {
-                (PayloadValue::I64(x), PayloadValue::I64(y)) => PayloadValue::I64(x + y),
-                _ => panic!("UAdd expects i64 inputs"),
-            }
+            PayloadValue::I64(i64_in(&block.inputs[0]).wrapping_add(i64_in(&block.inputs[1])))
         }
+        Opcode::USub => {
+            PayloadValue::I64(i64_in(&block.inputs[0]).wrapping_sub(i64_in(&block.inputs[1])))
+        }
+        Opcode::UMul => {
+            PayloadValue::I64(i64_in(&block.inputs[0]).wrapping_mul(i64_in(&block.inputs[1])))
+        }
+        Opcode::UDiv => {
+            let b = i64_in(&block.inputs[1]);
+            assert!(b != 0, "UDiv: division by zero");
+            PayloadValue::I64(i64_in(&block.inputs[0]).wrapping_div(b))
+        }
+        Opcode::URem => {
+            let b = i64_in(&block.inputs[1]);
+            assert!(b != 0, "URem: division by zero");
+            PayloadValue::I64(i64_in(&block.inputs[0]).wrapping_rem(b))
+        }
+
+        // ── Batch 1: Comparison (returns 1 or 0) ─────────────────────
+        Opcode::UCmpEq => {
+            PayloadValue::I64((i64_in(&block.inputs[0]) == i64_in(&block.inputs[1])) as i64)
+        }
+        Opcode::UCmpLt => {
+            PayloadValue::I64((i64_in(&block.inputs[0]) < i64_in(&block.inputs[1])) as i64)
+        }
+        Opcode::UCmpLe => {
+            PayloadValue::I64((i64_in(&block.inputs[0]) <= i64_in(&block.inputs[1])) as i64)
+        }
+
+        // ── Batch 2: Logic ────────────────────────────────────────────
+        Opcode::UAnd => {
+            PayloadValue::I64(i64_in(&block.inputs[0]) & i64_in(&block.inputs[1]))
+        }
+        Opcode::UOr => {
+            PayloadValue::I64(i64_in(&block.inputs[0]) | i64_in(&block.inputs[1]))
+        }
+        Opcode::UXor => {
+            PayloadValue::I64(i64_in(&block.inputs[0]) ^ i64_in(&block.inputs[1]))
+        }
+        Opcode::UNot => {
+            PayloadValue::I64(!i64_in(&block.inputs[0]))
+        }
+
+        // ── Batch 2: Shift ────────────────────────────────────────────
+        Opcode::UShl => {
+            let amt = (i64_in(&block.inputs[1]) & 63) as u32;
+            PayloadValue::I64(i64_in(&block.inputs[0]).wrapping_shl(amt))
+        }
+        Opcode::UShr => {
+            let amt = (i64_in(&block.inputs[1]) & 63) as u32;
+            PayloadValue::I64(((i64_in(&block.inputs[0]) as u64).wrapping_shr(amt)) as i64)
+        }
+        Opcode::UShra => {
+            let amt = (i64_in(&block.inputs[1]) & 63) as u32;
+            PayloadValue::I64(i64_in(&block.inputs[0]).wrapping_shr(amt))
+        }
+
+        // ── String ───────────────────────────────────────────────────
         Opcode::UConcat => {
+            let to_s = |v: &PayloadValue| match v {
+                PayloadValue::I64(n) => n.to_string(),
+                PayloadValue::Str(s) => s.clone(),
+            };
             let a = ctx.get(&block.inputs[0]).expect("missing input left");
             let b = ctx.get(&block.inputs[1]).expect("missing input right");
-            let left = match a {
-                PayloadValue::I64(v) => v.to_string(),
-                PayloadValue::Str(s) => s.clone(),
-            };
-            let right = match b {
-                PayloadValue::I64(v) => v.to_string(),
-                PayloadValue::Str(s) => s.clone(),
-            };
-            PayloadValue::Str(format!("{left}{right}"))
+            PayloadValue::Str(format!("{}{}", to_s(a), to_s(b)))
         }
     }
 }

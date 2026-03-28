@@ -8,10 +8,31 @@ pub enum MergeMode {
 
 #[derive(Debug, Clone)]
 pub enum Opcode {
+    // ── Constants ────────────────────────────────────────────────
     UConstI64(i64),
     UConstStr(String),
-    UAdd,
-    UConcat,
+
+    // ── Batch 1: Arithmetic + Comparison ─────────────────────────
+    UAdd,   // i64 + i64
+    USub,   // i64 - i64
+    UMul,   // i64 * i64  (low 64 bits)
+    UDiv,   // i64 / i64  (quotient)
+    URem,   // i64 % i64  (remainder)
+    UCmpEq, // i64 == i64  → 1 or 0
+    UCmpLt, // i64 <  i64  → 1 or 0
+    UCmpLe, // i64 <= i64  → 1 or 0
+
+    // ── Batch 2: Logic + Shift ────────────────────────────────────
+    UAnd,   // i64 & i64
+    UOr,    // i64 | i64
+    UXor,   // i64 ^ i64
+    UNot,   // !i64  (bitwise NOT, 1 input)
+    UShl,   // i64 << i64
+    UShr,   // i64 >> i64  (logical)
+    UShra,  // i64 >> i64  (arithmetic)
+
+    // ── String ───────────────────────────────────────────────────
+    UConcat, // any ++ any → Str
 }
 
 #[derive(Debug, Clone)]
