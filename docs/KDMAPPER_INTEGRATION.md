@@ -378,6 +378,110 @@ DLL 内部所有函数均使用全局 `g_device_handle`，Rust 侧传入的 hand
 
 ---
 
+## Rust 动态 DLL 问题详解
+
+> 本节解释为什么 GNU link.exe 会破坏 Rust 的 proc-macro DLL 机制，以及 GNU 与 MSVC 工具链的本质区别。
+
+### Proc-Macro DLL 机制
+
+本项目依赖的若干 crate 属于 **proc-macro 类型**，Rust 编译器会在**编译期**将其编译为 `.dll` 并动态加载，用于展开宏：
+
+```
+futures_macro-*.dll      ← futures 宏展开
+serde_derive-*.dll       ← #[derive(Serialize, Deserialize)]
+tokio_macros-*.dll       ← #[tokio::main], #[tokio::test]
+zerocopy_derive-*.dll    ← #[derive(FromBytes)] 等
+```
+
+这些 DLL 不是运行时依赖，而是 `rustc` 在 **build 阶段自己加载**的。
+
+### GNU link.exe 如何破坏编译流程
+
+```
+cargo build 启动
+    │
+    ├─ 编译 build script (urx-runtime-v08 build.rs)
+    │       ↓
+    │   GNU link.exe 不认识 MSVC 格式的 .o 文件
+    │   报错: extra operand '*.rcgu.o'  ← 在这里就已失败
+    │
+    ├─ [若 build script 侥幸跳过] 编译 proc-macro DLL
+    │       ↓
+    │   GNU 生成的 DLL 缺少 Windows 标准导出表 / .pdata
+    │   rustc 调用 GetProcAddress 加载宏入口 → 失败或崩溃
+    │
+    └─ 最终二进制链接阶段永远无法到达
+```
+
+### GNU vs MSVC 工具链深度对比
+
+#### 1. 异常处理模型
+
+| 项目 | GNU (MinGW/Git) | MSVC |
+|------|----------------|------|
+| 异常机制 | DWARF / SjLj | Windows SEH (结构化异常处理) |
+| `.pdata` 段 | 不生成 | 每个函数都有 RUNTIME_FUNCTION 记录 |
+| 栈展开 | libgcc_s 负责 | Windows 内核 `RtlUnwindEx` |
+| 内核兼容性 | **不兼容**，内核不认识 DWARF | 完全兼容 |
+
+`.pdata` 缺失的后果：当异常发生（包括 Access Violation）时，Windows 无法定位当前函数的 unwind 信息，直接触发 **EXCEPTION_NONCONTINUABLE**，进而在内核调用路径上演变为 BSOD。
+
+#### 2. C 运行时 (CRT)
+
+| 项目 | GNU | MSVC |
+|------|-----|------|
+| 运行时库 | `msvcrt.dll`（旧版）或 `libgcc` | `vcruntime140.dll` + `ucrtbase.dll` |
+| 堆实现 | GNU 堆 | Windows 原生堆 (HeapAlloc) |
+| 跨模块传对象 | **危险**：`std::string` 析构时用错误的 free | 安全：同一 CRT |
+
+`kdmapper_wrapper.cpp` 大量使用 `std::string`、`std::vector`（见 `g_last_error`、`raw_image`）。若调用方（Rust exe）与被调方（kdmapper_cpp.dll）的 CRT 不同，跨模块的字符串/容器操作会导致**堆损坏**。
+
+#### 3. PE 文件格式差异
+
+| PE 段 | GNU link 输出 | MSVC link 输出 |
+|-------|-------------|---------------|
+| `.pdata` | 缺失或不完整 | 完整的 x64 unwind 表 |
+| `.xdata` | 缺失 | 包含 UNWIND_INFO |
+| 导出表 | 基本正确 | 完整，含转发导出 |
+| 调试信息 | DWARF (`.debug_*`) | PDB + CodeView |
+| Manifest | 可能缺失 | 正确嵌入 |
+
+对于需要被 `rustc` 或 Windows 加载器精确解析的 proc-macro DLL，`.pdata`/`.xdata` 缺失是致命的。
+
+#### 4. 调用约定（x64 下不是问题）
+
+x64 Windows 上 GNU 和 MSVC **均使用 Microsoft x64 调用约定**（rcx/rdx/r8/r9 传参），这一点两者一致，**不是**本次问题的原因。32 位下才有 `__stdcall` vs `__cdecl` 的区分。
+
+### 为什么 `.cargo/config.toml` 能解决所有问题
+
+指定 MSVC `link.exe` 后，整个编译链统一使用 MSVC 工具链：
+
+```
+rustc (x86_64-pc-windows-msvc target)
+    │  使用 MSVC link.exe
+    ▼
+proc-macro DLL → 正确的 PE 格式 + 导出表 → rustc 成功加载
+    │
+    ▼
+最终二进制 → 包含 .pdata SEH 表 → 异常可正确展开
+    │
+    ▼
+调用 kdmapper_cpp.dll（同为 MSVC 编译）→ CRT 一致 → 堆操作安全
+    │
+    ▼
+内核操作参数正确传递 → 不蓝屏
+```
+
+### kdmapper_cpp.dll 与 Rust 的 DLL 层次区分
+
+| DLL | 类型 | 加载时机 | 与本次问题的关系 |
+|-----|------|---------|----------------|
+| `futures_macro-*.dll` 等 | proc-macro | 编译期，由 rustc 加载 | **直接受影响**，GNU 链接导致格式错误 |
+| `kdmapper_cpp.dll` | 运行时，libloading | 运行期，`kdmapper-native` feature 开启时 | 间接受影响（CRT 不匹配） |
+| `std-*.dll` / `rustc_driver-*.dll` | Rust 标准库 | 运行期（winget 安装的 Rust 为动态链接） | 不受影响，由 Rust 安装目录提供 |
+
+---
+
 ## 下一步工作 (可选)
 
 - [ ] 实现 IR 扩展 (内核操作码)
@@ -391,6 +495,7 @@ DLL 内部所有函数均使用全局 `g_device_handle`，Rust 侧传入的 hand
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v1.2.0 | 2026-03-28 | 新增 Rust proc-macro DLL 机制说明及 GNU vs MSVC 工具链深度对比 |
 | v1.1.0 | 2026-03-28 | 新增 GNU 工具链蓝屏根因分析，记录 MSVC linker 修复方案 |
 | v1.0.0 | 2026-03-28 | 实现完成，测试通过 |
 | v0.1.0 | 2026-03-27 | 初始设计 |
