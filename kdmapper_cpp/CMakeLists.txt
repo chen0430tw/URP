@@ -10,6 +10,7 @@ set(KDMAPPER_DIR "C:/Users/Administrator/kdmapper/kdmapper" CACHE PATH "Path to 
 # Include directories
 include_directories(
     ${KDMAPPER_DIR}
+    ${KDMAPPER_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -21,6 +22,7 @@ set(WRAPPER_SOURCES
 set(KDMAPPER_SOURCES
     ${KDMAPPER_DIR}/intel_driver.cpp
     ${KDMAPPER_DIR}/kdmapper.cpp
+    ${KDMAPPER_DIR}/KDSymbolsHandler.cpp
     ${KDMAPPER_DIR}/portable_executable.cpp
     ${KDMAPPER_DIR}/service.cpp
     ${KDMAPPER_DIR}/utils.cpp
@@ -39,8 +41,10 @@ set_target_properties(kdmapper_cpp PROPERTIES
 if(WIN32)
     target_compile_definitions(kdmapper_cpp PRIVATE
         _CRT_SECURE_NO_WARNINGS
-        WIN32_LEAN_AND_MEAN
-        NOMINMAX
+        KDLIBMODE
+        _UNICODE
+        UNICODE
+        DISABLE_OUTPUT
     )
 
     # Link Windows libraries

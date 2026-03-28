@@ -1,21 +1,22 @@
 //! KDMapper C++ Wrapper Implementation
 //!
 //! Implementation of C-compatible wrapper functions for KDMapper.
+//! Updated for TheCruZ/kdmapper API where device handle is global state.
 
 #include "kdmapper_wrapper.hpp"
-#include "../kdmapper/kdmapper.hpp"
-#include "../kdmapper/intel_driver.hpp"
-#include "../kdmapper/service.hpp"
-#include "../kdmapper/utils.hpp"
+#include "kdmapper.hpp"
+#include "intel_driver.hpp"
+#include "portable_executable.hpp"
+#include "utils.hpp"
 #include <string>
 #include <vector>
+#include <filesystem>
 
 // ============================================================================
 // Global State
 // ============================================================================
 
 static std::string g_last_error;
-static HANDLE g_device_handle = nullptr;
 static bool g_intel_driver_loaded = false;
 
 // ============================================================================
@@ -33,6 +34,10 @@ static void set_last_error_fmt(const char* fmt, ...) {
     vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
     g_last_error = buffer;
+}
+
+static std::wstring str_to_wstr(const std::string& s) {
+    return std::wstring(s.begin(), s.end());
 }
 
 // ============================================================================
@@ -61,38 +66,29 @@ KDMapperDevice* kdmapper_load_intel_driver(const char* driver_path) {
         return nullptr;
     }
 
-    std::string driver_path_str = driver_path ? driver_path : "iqvw64e.sys";
+    // driver_path is ignored in current API - iqvw64e.sys is embedded in the binary
+    (void)driver_path;
 
-    // Check if driver exists
-    if (driver_path && !std::filesystem::exists(driver_path_str)) {
-        set_last_error_fmt("Driver file not found: %s", driver_path);
-        return nullptr;
-    }
-
-    // Load the Intel driver
-    g_device_handle = intel_driver::Load();
-    if (!g_device_handle || g_device_handle == INVALID_HANDLE_VALUE) {
-        set_last_error("Failed to load Intel driver");
+    NTSTATUS status = intel_driver::Load();
+    if (!NT_SUCCESS(status)) {
+        set_last_error_fmt("Failed to load Intel driver (NTSTATUS: 0x%08X)", status);
         return nullptr;
     }
 
     g_intel_driver_loaded = true;
 
-    // Return a dummy handle (we use the global g_device_handle internally)
+    // Return a dummy handle (device is stored in intel_driver::hDevice globally)
     static KDMapperDevice dummy_handle;
     return &dummy_handle;
 }
 
 void kdmapper_unload_intel_driver(KDMapperDevice* handle) {
+    (void)handle;
     if (!g_intel_driver_loaded) {
         return;
     }
 
-    if (g_device_handle && g_device_handle != INVALID_HANDLE_VALUE) {
-        intel_driver::Unload(g_device_handle);
-    }
-
-    g_device_handle = nullptr;
+    intel_driver::Unload();
     g_intel_driver_loaded = false;
 }
 
@@ -106,7 +102,8 @@ bool kdmapper_read_memory(
     uint8_t* buffer,
     uint64_t size
 ) {
-    if (!g_intel_driver_loaded || !g_device_handle) {
+    (void)handle;
+    if (!g_intel_driver_loaded) {
         set_last_error("Intel driver not loaded");
         return false;
     }
@@ -116,7 +113,7 @@ bool kdmapper_read_memory(
         return false;
     }
 
-    return intel_driver::ReadMemory(g_device_handle, address, buffer, size);
+    return intel_driver::ReadMemory(address, buffer, size);
 }
 
 bool kdmapper_write_memory(
@@ -125,7 +122,8 @@ bool kdmapper_write_memory(
     const uint8_t* buffer,
     uint64_t size
 ) {
-    if (!g_intel_driver_loaded || !g_device_handle) {
+    (void)handle;
+    if (!g_intel_driver_loaded) {
         set_last_error("Intel driver not loaded");
         return false;
     }
@@ -135,7 +133,7 @@ bool kdmapper_write_memory(
         return false;
     }
 
-    return intel_driver::WriteMemory(g_device_handle, address, const_cast<uint8_t*>(buffer), size);
+    return intel_driver::WriteMemory(address, const_cast<uint8_t*>(buffer), size);
 }
 
 bool kdmapper_set_memory(
@@ -144,7 +142,8 @@ bool kdmapper_set_memory(
     uint32_t value,
     uint64_t size
 ) {
-    if (!g_intel_driver_loaded || !g_device_handle) {
+    (void)handle;
+    if (!g_intel_driver_loaded) {
         set_last_error("Intel driver not loaded");
         return false;
     }
@@ -154,7 +153,7 @@ bool kdmapper_set_memory(
         return false;
     }
 
-    return intel_driver::SetMemory(g_device_handle, address, value, size);
+    return intel_driver::SetMemory(address, value, size);
 }
 
 // ============================================================================
@@ -166,7 +165,8 @@ uint64_t kdmapper_allocate_pool(
     uint32_t pool_type,
     uint64_t size
 ) {
-    if (!g_intel_driver_loaded || !g_device_handle) {
+    (void)handle;
+    if (!g_intel_driver_loaded) {
         set_last_error("Intel driver not loaded");
         return 0;
     }
@@ -176,14 +176,15 @@ uint64_t kdmapper_allocate_pool(
         return 0;
     }
 
-    return intel_driver::AllocatePool(g_device_handle, static_cast<nt::POOL_TYPE>(pool_type), size);
+    return intel_driver::AllocatePool(static_cast<nt::POOL_TYPE>(pool_type), size);
 }
 
 bool kdmapper_free_pool(
     KDMapperDevice* handle,
     uint64_t address
 ) {
-    if (!g_intel_driver_loaded || !g_device_handle) {
+    (void)handle;
+    if (!g_intel_driver_loaded) {
         set_last_error("Intel driver not loaded");
         return false;
     }
@@ -193,7 +194,7 @@ bool kdmapper_free_pool(
         return false;
     }
 
-    return intel_driver::FreePool(g_device_handle, address);
+    return intel_driver::FreePool(address);
 }
 
 // ============================================================================
@@ -208,7 +209,8 @@ bool kdmapper_map_driver(
     uint64_t* out_entry_point,
     uint32_t* out_status
 ) {
-    if (!g_intel_driver_loaded || !g_device_handle) {
+    (void)handle;
+    if (!g_intel_driver_loaded) {
         set_last_error("Intel driver not loaded");
         return false;
     }
@@ -218,8 +220,8 @@ bool kdmapper_map_driver(
         return false;
     }
 
-    std::string driver_path_str(driver_path);
-    if (!std::filesystem::exists(driver_path_str)) {
+    std::wstring driver_path_w = str_to_wstr(std::string(driver_path));
+    if (!std::filesystem::exists(driver_path_w)) {
         set_last_error_fmt("Driver file not found: %s", driver_path);
         return false;
     }
@@ -230,17 +232,9 @@ bool kdmapper_map_driver(
     *out_entry_point = 0;
     *out_status = 0;
 
-    // Map the driver
-    uint64_t base_address = kdmapper::MapDriver(g_device_handle, driver_path_str);
-
-    if (!base_address) {
-        set_last_error("Failed to map driver");
-        return false;
-    }
-
-    // Get NT headers to find image size and entry point
-    std::vector<uint8_t> raw_image;
-    if (!utils::ReadFileToMemory(driver_path_str, &raw_image)) {
+    // Read driver file into memory (new API takes BYTE* data, not file path)
+    std::vector<BYTE> raw_image;
+    if (!kdmUtils::ReadFileToMemory(driver_path_w, &raw_image)) {
         set_last_error("Failed to read driver file");
         return false;
     }
@@ -251,19 +245,32 @@ bool kdmapper_map_driver(
         return false;
     }
 
+    NTSTATUS entry_status = STATUS_SUCCESS;
+
+    // Map the driver (data pointer, destroyHeader=true to erase headers)
+    uint64_t base_address = kdmapper::MapDriver(
+        raw_image.data(),
+        0, 0,
+        false,          // free (don't free raw_image)
+        true,           // destroyHeader
+        kdmapper::AllocationMode::AllocatePool,
+        false,
+        nullptr,
+        &entry_status
+    );
+
+    if (!base_address) {
+        set_last_error_fmt("Failed to map driver (DriverEntry NTSTATUS: 0x%08X)", entry_status);
+        return false;
+    }
+
     *out_base_address = base_address;
     *out_image_size = nt_headers->OptionalHeader.SizeOfImage;
     *out_entry_point = base_address + nt_headers->OptionalHeader.AddressOfEntryPoint;
-
-    // Note: MapDriver doesn't return the actual NTSTATUS from DriverEntry.
-    // Set STATUS_SUCCESS (0x00000000).
-    *out_status = 0;
+    *out_status = static_cast<uint32_t>(entry_status);
 
     // Post-map cleanup: remove the Intel driver's entry from MmUnloadedDrivers.
-    // This reduces the forensic window that PatchGuard uses to detect manually
-    // mapped drivers. Done automatically so callers don't have to remember.
-    if (!intel_driver::ClearMmUnloadedDrivers(g_device_handle)) {
-        // Non-fatal: log but don't fail the mapping operation.
+    if (!intel_driver::ClearMmUnloadedDrivers()) {
         set_last_error("Warning: ClearMmUnloadedDrivers failed after successful map");
     }
 
@@ -281,7 +288,9 @@ bool kdmapper_execute_shellcode(
     uint32_t timeout_ms,
     uint64_t* out_result
 ) {
-    if (!g_intel_driver_loaded || !g_device_handle) {
+    (void)handle;
+    (void)timeout_ms;
+    if (!g_intel_driver_loaded) {
         set_last_error("Intel driver not loaded");
         return false;
     }
@@ -293,8 +302,7 @@ bool kdmapper_execute_shellcode(
 
     // Allocate kernel memory for shellcode
     uint64_t shellcode_addr = intel_driver::AllocatePool(
-        g_device_handle,
-        nt::NonPagedPool,
+        nt::POOL_TYPE::NonPagedPool,
         shellcode_size
     );
 
@@ -304,27 +312,18 @@ bool kdmapper_execute_shellcode(
     }
 
     // Write shellcode to kernel memory
-    if (!intel_driver::WriteMemory(
-        g_device_handle,
-        shellcode_addr,
-        const_cast<uint8_t*>(shellcode),
-        shellcode_size
-    )) {
-        intel_driver::FreePool(g_device_handle, shellcode_addr);
+    if (!intel_driver::WriteMemory(shellcode_addr, const_cast<uint8_t*>(shellcode), shellcode_size)) {
+        intel_driver::FreePool(shellcode_addr);
         set_last_error("Failed to write shellcode to kernel memory");
         return false;
     }
 
     // Execute shellcode
     uint64_t result = 0;
-    bool success = intel_driver::CallKernelFunction(
-        g_device_handle,
-        &result,
-        shellcode_addr
-    );
+    bool success = intel_driver::CallKernelFunction(&result, shellcode_addr);
 
     // Free shellcode memory
-    intel_driver::FreePool(g_device_handle, shellcode_addr);
+    intel_driver::FreePool(shellcode_addr);
 
     if (!success) {
         set_last_error("Failed to execute shellcode");
@@ -343,7 +342,8 @@ uint64_t kdmapper_get_module_base(
     KDMapperDevice* handle,
     const char* module_name
 ) {
-    if (!g_intel_driver_loaded || !g_device_handle) {
+    (void)handle;
+    if (!g_intel_driver_loaded) {
         set_last_error("Intel driver not loaded");
         return 0;
     }
@@ -353,7 +353,7 @@ uint64_t kdmapper_get_module_base(
         return 0;
     }
 
-    return utils::GetKernelModuleAddress(std::string(module_name));
+    return kdmUtils::GetKernelModuleAddress(std::string(module_name));
 }
 
 uint64_t kdmapper_get_module_export(
@@ -361,7 +361,8 @@ uint64_t kdmapper_get_module_export(
     uint64_t module_base,
     const char* function_name
 ) {
-    if (!g_intel_driver_loaded || !g_device_handle) {
+    (void)handle;
+    if (!g_intel_driver_loaded) {
         set_last_error("Intel driver not loaded");
         return 0;
     }
@@ -371,11 +372,7 @@ uint64_t kdmapper_get_module_export(
         return 0;
     }
 
-    return intel_driver::GetKernelModuleExport(
-        g_device_handle,
-        module_base,
-        std::string(function_name)
-    );
+    return intel_driver::GetKernelModuleExport(module_base, std::string(function_name));
 }
 
 // ============================================================================
@@ -383,12 +380,13 @@ uint64_t kdmapper_get_module_export(
 // ============================================================================
 
 bool kdmapper_clear_unloaded_drivers(KDMapperDevice* handle) {
-    if (!g_intel_driver_loaded || !g_device_handle) {
+    (void)handle;
+    if (!g_intel_driver_loaded) {
         set_last_error("Intel driver not loaded");
         return false;
     }
 
-    return intel_driver::ClearMmUnloadedDrivers(g_device_handle);
+    return intel_driver::ClearMmUnloadedDrivers();
 }
 
 // ============================================================================
