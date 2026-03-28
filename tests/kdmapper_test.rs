@@ -2,6 +2,9 @@
 //!
 //! These tests verify the KDMapper FFI bindings work correctly.
 //! NOTE: Most tests require administrator privileges to function.
+//! Run with: cargo test --features kdmapper
+
+#![cfg(feature = "kdmapper")]
 
 use urx_runtime_v08::kdmapper_ffi::*;
 
