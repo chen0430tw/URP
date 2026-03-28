@@ -39,6 +39,8 @@
 //! ```
 
 pub mod cost;
+#[cfg(feature = "gpu")]
+pub mod gpu_executor;
 pub mod executor;
 pub mod ir;
 pub mod node;
@@ -68,6 +70,8 @@ pub use kdmapper_ffi::{
 // Re-export commonly used types
 pub use cost::{node_score, route_cost};
 pub use executor::{BlockExecutor, CpuExecutor, eval_opcode, ExecutorRegistry, HardwareExecutor, ThreadPoolExecutor};
+#[cfg(feature = "gpu")]
+pub use gpu_executor::WgpuExecutor;
 pub use ir::{IRBlock, IREdge, IRGraph, MergeMode, Opcode};
 pub use node::{Node, NodeType};
 pub use optimizer::{fuse_linear_blocks, partition_graph};

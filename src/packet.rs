@@ -65,7 +65,7 @@ impl URPPacket {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PayloadValue {
     I64(i64),
     Str(String),
