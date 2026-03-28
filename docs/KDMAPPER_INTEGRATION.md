@@ -571,12 +571,126 @@ DriverEntryNtStatus(u32)  // DriverEntry 返回非零 NTSTATUS，携带原始错
 
 ---
 
+---
+
+## TheCruZ/kdmapper 新版 API 适配记录（v1.4.0）
+
+> 日期：2026-03-28
+
+### 背景
+
+kdmapper 上游（https://github.com/TheCruZ/kdmapper）经过大幅重构，API 与旧版本不兼容。
+本次适配把 `kdmapper_wrapper.cpp` 完全重写以对齐新版接口。
+
+### 核心变化：从有状态 Handle 到全局状态
+
+| 方面 | 旧版 | 新版 |
+|------|------|------|
+| `Load()` 返回值 | `HANDLE device` | `NTSTATUS`（成功=0） |
+| 设备 Handle 传递 | 每个函数接受 `HANDLE` 参数 | 全局 `intel_driver::hDevice` |
+| `Unload()` | `Unload(HANDLE)` | `Unload()` 无参数 |
+| 内存读写 | `ReadMemory(handle, addr, buf, size)` | `ReadMemory(addr, buf, size)` |
+| 内存分配 | `AllocatePool(handle, type, size)` | `AllocatePool(type, size)` |
+| 驱动映射 | `MapDriver(handle, path_string)` | `MapDriver(BYTE* data, ...)` 传内存数据 |
+| utils 命名空间 | `utils::GetKernelModuleAddress` | `kdmUtils::GetKernelModuleAddress` |
+| 反取证 | `ClearMmUnloadedDrivers(handle)` | `ClearMmUnloadedDrivers()` 无参数 |
+
+### CMakeLists.txt 变更
+
+```cmake
+# 旧版
+include_directories(${KDMAPPER_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(kdmapper_cpp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+
+# 新版
+include_directories(
+    ${KDMAPPER_DIR}
+    ${KDMAPPER_DIR}/include      # ← 新增：头文件移入 include/ 子目录
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+# 新增 KDSymbolsHandler.cpp 源文件
+set(KDMAPPER_SOURCES
+    ...
+    ${KDMAPPER_DIR}/KDSymbolsHandler.cpp
+)
+# WIN32_LEAN_AND_MEAN 导致 FILE_ANY_ACCESS 未定义，改用原项目的 define 组合
+target_compile_definitions(kdmapper_cpp PRIVATE
+    _CRT_SECURE_NO_WARNINGS KDLIBMODE _UNICODE UNICODE DISABLE_OUTPUT
+)
+```
+
+**`WIN32_LEAN_AND_MEAN` 为何不能用**：该宏会阻止 `windows.h` 自动包含 `winioctl.h`，
+而 `intel_driver.cpp` 用到的 `FILE_ANY_ACCESS`（值为 0）定义在 `winioctl.h` 中。
+
+### MapDriver API 变化的影响
+
+新版 `kdmapper::MapDriver` 不再接受文件路径，而是直接接受内存中的 PE 数据：
+
+```cpp
+// 旧版
+uint64_t base = kdmapper::MapDriver(g_device_handle, driver_path_str);
+
+// 新版（wrapper 内部先读文件，再传数据）
+std::vector<BYTE> raw_image;
+kdmUtils::ReadFileToMemory(driver_path_w, &raw_image);
+uint64_t base = kdmapper::MapDriver(
+    raw_image.data(),
+    0, 0,
+    false,          // free
+    true,           // destroyHeader（映射后擦除 PE 头）
+    kdmapper::AllocationMode::AllocatePool,
+    false,
+    nullptr,
+    &entry_status   // ← 新增：可获取 DriverEntry 的 NTSTATUS 返回值
+);
+```
+
+`destroyHeader=true` 会在映射后立即擦除内核内存中的 PE MZ 头，减少内存扫描被发现的风险。
+`entry_status` 现在可以直接拿到驱动 DriverEntry 的返回码，不再是固定 0。
+
+### iqvw64e.sys 嵌入方式确认
+
+**不需要外部 iqvw64e.sys 文件**。驱动字节数据完整嵌入在：
+
+```
+C:\Users\Administrator\kdmapper\kdmapper\include\intel_driver_resource.hpp
+```
+
+以 `static const uint8_t driver[] = { 0x4D, 0x5A, ... }` 的形式硬编码，
+编译时直接链接进 `kdmapper_cpp.dll`，运行时由 `intel_driver::Load()` 写入临时文件再加载。
+
+### 编译结果
+
+```
+kdmapper_cpp.dll  55KB  ✅ (旧版 46KB，新版因含 KDSymbolsHandler 略大)
+全部 44 测试通过（含 sudo 执行的 2 个管理员测试）
+```
+
+### iqvw64e.sys 与 Windows Blocklist
+
+| Windows 版本 | 默认状态 | 结果 |
+|-------------|---------|------|
+| Windows 10 | 未启用 | 可正常加载 |
+| Windows 11 < 24H2 | 未启用 | 可正常加载 |
+| Windows 11 24H2+ | **默认启用** | `STATUS_IMAGE_CERT_REVOKED`，被拦截 |
+
+当前机器（Windows 10 19045）不受影响。若需在 Win11 24H2+ 使用，需要：
+
+```
+HKLM\SYSTEM\CurrentControlSet\Control\CI\Config
+VulnerableDriverBlocklistEnable = DWORD 0
+```
+
+修改后必须**完全断电重启**（不是"重启"按钮，Fast Startup 会缓存旧设置）。
+
+---
+
 ## 下一步工作 (可选)
 
 - [ ] 实现 IR 扩展 (内核操作码)
 - [ ] 添加 NodeType::Kernel
 - [ ] 实现内核感知调度策略
-- [ ] 添加更多集成测试
+- [ ] 多 Provider 支持（参考 KDU 架构，替换 iqvw64e.sys）
 
 ---
 
@@ -584,6 +698,7 @@ DriverEntryNtStatus(u32)  // DriverEntry 返回非零 NTSTATUS，携带原始错
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v1.4.0 | 2026-03-28 | TheCruZ/kdmapper 新版 API 适配；全局状态重构；MapDriver 内存数据接口；CMake 修复 |
 | v1.3.0 | 2026-03-28 | KDU 架构研究；自动 MmUnloadedDrivers 清理；C++ 错误透传；DriverEntryNtStatus 错误变体 |
 | v1.2.0 | 2026-03-28 | 新增 Rust proc-macro DLL 机制说明及 GNU vs MSVC 工具链深度对比 |
 | v1.1.0 | 2026-03-28 | 新增 GNU 工具链蓝屏根因分析，记录 MSVC linker 修复方案 |
