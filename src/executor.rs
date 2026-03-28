@@ -194,15 +194,83 @@ pub fn eval_opcode(block: &IRBlock, ctx: &HashMap<String, PayloadValue>) -> Payl
             PayloadValue::I64(i64_in(&block.inputs[0]).wrapping_shr(amt))
         }
 
-        // ── String ───────────────────────────────────────────────────
+        // ── Batch 3: String / Type Conversion ────────────────────────
         Opcode::UConcat => {
             let to_s = |v: &PayloadValue| match v {
                 PayloadValue::I64(n) => n.to_string(),
                 PayloadValue::Str(s) => s.clone(),
+                PayloadValue::List(_) => panic!("UConcat: List input not supported"),
             };
             let a = ctx.get(&block.inputs[0]).expect("missing input left");
             let b = ctx.get(&block.inputs[1]).expect("missing input right");
             PayloadValue::Str(format!("{}{}", to_s(a), to_s(b)))
+        }
+        Opcode::UI64ToStr => {
+            PayloadValue::Str(i64_in(&block.inputs[0]).to_string())
+        }
+        Opcode::UStrToI64 => {
+            let s = match ctx.get(&block.inputs[0]).expect("missing input") {
+                PayloadValue::Str(s) => s.clone(),
+                other => panic!("UStrToI64 expects Str, got {other:?}"),
+            };
+            PayloadValue::I64(s.trim().parse::<i64>().unwrap_or_else(|e| {
+                panic!("UStrToI64: cannot parse {:?}: {e}", s)
+            }))
+        }
+        Opcode::UStrLen => {
+            let s = match ctx.get(&block.inputs[0]).expect("missing input") {
+                PayloadValue::Str(s) => s.clone(),
+                other => panic!("UStrLen expects Str, got {other:?}"),
+            };
+            PayloadValue::I64(s.chars().count() as i64)
+        }
+        Opcode::UStrSlice => {
+            let s = match ctx.get(&block.inputs[0]).expect("missing input str") {
+                PayloadValue::Str(s) => s.clone(),
+                other => panic!("UStrSlice input[0] expects Str, got {other:?}"),
+            };
+            let start = i64_in(&block.inputs[1]).max(0) as usize;
+            let end   = i64_in(&block.inputs[2]).max(0) as usize;
+            let chars: Vec<char> = s.chars().collect();
+            let end = end.min(chars.len());
+            let start = start.min(end);
+            PayloadValue::Str(chars[start..end].iter().collect())
+        }
+        Opcode::UStrSplit => {
+            let s = match ctx.get(&block.inputs[0]).expect("missing input str") {
+                PayloadValue::Str(s) => s.clone(),
+                other => panic!("UStrSplit input[0] expects Str, got {other:?}"),
+            };
+            let delim = match ctx.get(&block.inputs[1]).expect("missing input delim") {
+                PayloadValue::Str(s) => s.clone(),
+                other => panic!("UStrSplit input[1] expects Str, got {other:?}"),
+            };
+            let parts: Vec<PayloadValue> = s
+                .split(delim.as_str())
+                .map(|p| PayloadValue::Str(p.to_string()))
+                .collect();
+            PayloadValue::List(parts)
+        }
+
+        // ── Batch 4: Conditional Select + Aggregation ────────────────
+        Opcode::USelect => {
+            let cond = i64_in(&block.inputs[0]);
+            let key  = if cond != 0 { &block.inputs[1] } else { &block.inputs[2] };
+            ctx.get(key).unwrap_or_else(|| panic!("USelect: missing input '{key}'")).clone()
+        }
+        Opcode::UMin => {
+            PayloadValue::I64(i64_in(&block.inputs[0]).min(i64_in(&block.inputs[1])))
+        }
+        Opcode::UMax => {
+            PayloadValue::I64(i64_in(&block.inputs[0]).max(i64_in(&block.inputs[1])))
+        }
+        Opcode::UAbs => {
+            PayloadValue::I64(i64_in(&block.inputs[0]).wrapping_abs())
+        }
+        Opcode::UAssert => {
+            let cond = i64_in(&block.inputs[0]);
+            assert!(cond != 0, "UAssert: condition is 0 (false)");
+            PayloadValue::I64(cond)
         }
     }
 }

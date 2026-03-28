@@ -69,6 +69,7 @@ impl URPPacket {
 pub enum PayloadValue {
     I64(i64),
     Str(String),
+    List(Vec<PayloadValue>),
 }
 
 pub struct PayloadCodec;
@@ -91,6 +92,17 @@ impl PayloadCodec {
                 out.push(Self::TYPE_STR);
                 out.extend_from_slice(&(b.len() as u32).to_le_bytes());
                 out.extend_from_slice(b);
+                out
+            }
+            PayloadValue::List(items) => {
+                // Encode as: TYPE_LIST | u32(count) | encode(item)...
+                let mut out = vec![3u8]; // TYPE_LIST = 3
+                out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+                for item in items {
+                    let encoded = Self::encode(item);
+                    out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&encoded);
+                }
                 out
             }
         }

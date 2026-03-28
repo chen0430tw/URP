@@ -31,8 +31,20 @@ pub enum Opcode {
     UShr,   // i64 >> i64  (logical)
     UShra,  // i64 >> i64  (arithmetic)
 
-    // ── String ───────────────────────────────────────────────────
-    UConcat, // any ++ any → Str
+    // ── Batch 3: Type Conversion + String ────────────────────────
+    UConcat,     // any ++ any  → Str
+    UI64ToStr,   // i64         → Str  (decimal)
+    UStrToI64,   // Str         → i64  (parse, panic on error)
+    UStrLen,     // Str         → i64  (character count)
+    UStrSlice,   // Str, i64, i64 → Str  ([start, end))
+    UStrSplit,   // Str, Str    → List<Str>  (split by delimiter)
+
+    // ── Batch 4: Conditional Select + Aggregation ─────────────────
+    USelect,   // i64(cond), any, any → any   (cond≠0 → input[1], else input[2])
+    UMin,      // i64, i64 → i64
+    UMax,      // i64, i64 → i64
+    UAbs,      // i64      → i64
+    UAssert,   // i64(cond)  → i64   (pass-through; panics when cond == 0)
 }
 
 #[derive(Debug, Clone)]

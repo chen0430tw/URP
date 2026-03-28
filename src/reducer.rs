@@ -65,5 +65,9 @@ fn render_value(v: &PayloadValue) -> String {
     match v {
         PayloadValue::I64(x) => x.to_string(),
         PayloadValue::Str(s) => s.clone(),
+        PayloadValue::List(items) => {
+            let parts: Vec<String> = items.iter().map(render_value).collect();
+            format!("[{}]", parts.join(", "))
+        }
     }
 }
