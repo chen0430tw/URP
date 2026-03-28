@@ -1,0 +1,3 @@
+cargo:rerun-if-changed=build.rs
+cargo:warning=KDMapper native feature enabled - using dynamic DLL loading
+cargo:warning=Ensure kdmapper_cpp.dll is in the search path

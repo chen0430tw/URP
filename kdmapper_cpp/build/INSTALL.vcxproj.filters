@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\Administrator\URP\kdmapper_cpp\build\CMakeFiles\df0c80e2e535d77dc54de25582c38996\INSTALL_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{54094DDA-5C2F-3BBC-ACC1-6CB1ABE0517E}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

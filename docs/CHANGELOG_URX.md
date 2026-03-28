@@ -33,3 +33,18 @@
 - scheduler policy trait
 - topology-aware cost model
 - reservation / backfill skeleton
+
+## v0.9
+- **KDMapper FFI 集成** ✅
+  - Rust FFI 绑定层 (kdmapper_ffi.rs)
+  - C++ 包装库 (kdmapper_wrapper.{cpp,hpp})
+  - 动态加载支持 (libloading)
+  - Visual Studio + CMake 双构建支持
+  - Mock 测试模式 + Native 生产模式
+  - 34 个测试全部通过
+- 编译修复:
+  - MSVC v143 工具集适配
+  - winioctl.h 头文件添加
+  - ATL 依赖移除
+  - ntdll.lib 链接
+- 测试覆盖: 6 KDMapper 单元测试 + 28 集成测试

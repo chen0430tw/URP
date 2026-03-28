@@ -1,6 +1,14 @@
 //! KDMapper FFI Layer
 //!
 //! This module provides safe Rust bindings to KDMapper functionality.
+//!
+//! # Features
+//! - `kdmapper` - Enable KDMapper integration (requires C++ library)
+//!
+//! # Note
+//! When the `kdmapper` feature is enabled but the C++ library is not built,
+//! the FFI calls will fail with linkage errors. For testing purposes without
+//! the C++ library, use the mock functions or disable the feature.
 
 use std::ffi::{c_char, CString};
 use std::path::Path;
@@ -159,88 +167,492 @@ unsafe impl Sync for KDMapperExecutor {}
 // FFI Declarations (linked to kdmapper_cpp library)
 // ============================================================================
 
-extern "C" {
-    /// Check if the Intel driver is already running
-    fn kdmapper_is_running() -> bool;
+// When kdmapper-native feature is enabled, use dynamic loading via libloading
+#[cfg(feature = "kdmapper-native")]
+mod dynamic_ffi {
+    use super::FFIHandle;
+    use libloading::{Library, Symbol};
+    use std::ffi::c_char;
+    use std::path::Path;
 
-    /// Load the Intel vulnerable driver
-    /// Returns handle on success, null on failure
-    fn kdmapper_load_intel_driver(driver_path: *const c_char) -> *mut FFIHandle;
+    // Function pointer types
+    type FnIsRunning = unsafe extern "C" fn() -> bool;
+    type FnLoadIntelDriver = unsafe extern "C" fn(*const c_char) -> *mut FFIHandle;
+    type FnUnloadIntelDriver = unsafe extern "C" fn(*mut FFIHandle);
+    type FnReadMemory = unsafe extern "C" fn(*mut FFIHandle, u64, *mut u8, u64) -> bool;
+    type FnWriteMemory = unsafe extern "C" fn(*mut FFIHandle, u64, *const u8, u64) -> bool;
+    type FnSetMemory = unsafe extern "C" fn(*mut FFIHandle, u64, u32, u64) -> bool;
+    type FnAllocatePool = unsafe extern "C" fn(*mut FFIHandle, u32, u64) -> u64;
+    type FnFreePool = unsafe extern "C" fn(*mut FFIHandle, u64) -> bool;
+    type FnMapDriver = unsafe extern "C" fn(*mut FFIHandle, *const c_char, *mut u64, *mut u64, *mut u64, *mut u32) -> bool;
+    type FnExecuteShellcode = unsafe extern "C" fn(*mut FFIHandle, *const u8, u32, u32, *mut u64) -> bool;
+    type FnGetModuleBase = unsafe extern "C" fn(*mut FFIHandle, *const c_char) -> u64;
+    type FnGetModuleExport = unsafe extern "C" fn(*mut FFIHandle, u64, *const c_char) -> u64;
+    type FnClearUnloadedDrivers = unsafe extern "C" fn(*mut FFIHandle) -> bool;
 
-    /// Unload the Intel driver
-    fn kdmapper_unload_intel_driver(handle: *mut FFIHandle);
+    pub struct KDMapperLib {
+        _library: Library,
+    }
 
-    /// Read kernel memory
-    fn kdmapper_read_memory(
-        handle: *mut FFIHandle,
-        address: u64,
-        buffer: *mut u8,
-        size: u64,
-    ) -> bool;
+    impl KDMapperLib {
+        pub fn load() -> Result<Self, String> {
+            // Try multiple possible locations for the DLL
+            let dll_paths = vec![
+                "kdmapper_cpp.dll",
+                "../kdmapper_cpp/kdmapper_cpp.dll",
+                "./kdmapper_cpp.dll",
+            ];
 
-    /// Write kernel memory
-    fn kdmapper_write_memory(
-        handle: *mut FFIHandle,
-        address: u64,
-        buffer: *const u8,
-        size: u64,
-    ) -> bool;
+            let mut last_error = String::new();
 
-    /// Allocate kernel memory pool
-    fn kdmapper_allocate_pool(
-        handle: *mut FFIHandle,
-        pool_type: u32,
-        size: u64,
-    ) -> u64;
+            for dll_path in dll_paths {
+                match unsafe { Library::new(dll_path) } {
+                    Ok(lib) => {
+                        return Ok(KDMapperLib { _library: lib });
+                    }
+                    Err(e) => {
+                        last_error = format!("{}: {}", dll_path, e);
+                    }
+                }
+            }
 
-    /// Free kernel memory pool
-    fn kdmapper_free_pool(
-        handle: *mut FFIHandle,
-        address: u64,
-    ) -> bool;
+            Err(format!("Failed to load kdmapper_cpp.dll. Tried: {}", last_error))
+        }
 
-    /// Map a driver into kernel memory
-    fn kdmapper_map_driver(
-        handle: *mut FFIHandle,
-        driver_path: *const c_char,
-        out_base_address: *mut u64,
-        out_image_size: *mut u64,
-        out_entry_point: *mut u64,
-        out_status: *mut u32,
-    ) -> bool;
+        pub unsafe fn is_running(&self) -> Result<bool, String> {
+            let lib = &self._library;
+            let func: Symbol<FnIsRunning> = lib.get(b"kdmapper_is_running")
+                .map_err(|e| format!("Failed to get kdmapper_is_running: {}", e))?;
+            Ok(func())
+        }
 
-    /// Execute shellcode in kernel context
-    fn kdmapper_execute_shellcode(
-        handle: *mut FFIHandle,
-        shellcode: *const u8,
-        shellcode_size: u32,
-        timeout_ms: u32,
-        out_result: *mut u64,
-    ) -> bool;
+        pub unsafe fn load_intel_driver(&self, driver_path: *const c_char) -> Result<*mut FFIHandle, String> {
+            let lib = &self._library;
+            let func: Symbol<FnLoadIntelDriver> = lib.get(b"kdmapper_load_intel_driver")
+                .map_err(|e| format!("Failed to get kdmapper_load_intel_driver: {}", e))?;
+            Ok(func(driver_path))
+        }
 
-    /// Get kernel module base address
-    fn kdmapper_get_module_base(
-        handle: *mut FFIHandle,
-        module_name: *const c_char,
-    ) -> u64;
+        pub unsafe fn unload_intel_driver(&self, handle: *mut FFIHandle) -> Result<(), String> {
+            let lib = &self._library;
+            let func: Symbol<FnUnloadIntelDriver> = lib.get(b"kdmapper_unload_intel_driver")
+                .map_err(|e| format!("Failed to get kdmapper_unload_intel_driver: {}", e))?;
+            func(handle);
+            Ok(())
+        }
 
-    /// Get kernel module export address
-    fn kdmapper_get_module_export(
-        handle: *mut FFIHandle,
-        module_base: u64,
-        function_name: *const c_char,
-    ) -> u64;
+        pub unsafe fn read_memory(&self, handle: *mut FFIHandle, address: u64, buffer: *mut u8, size: u64) -> Result<bool, String> {
+            let lib = &self._library;
+            let func: Symbol<FnReadMemory> = lib.get(b"kdmapper_read_memory")
+                .map_err(|e| format!("Failed to get kdmapper_read_memory: {}", e))?;
+            Ok(func(handle, address, buffer, size))
+        }
 
-    /// Set memory to a specific value
-    fn kdmapper_set_memory(
-        handle: *mut FFIHandle,
-        address: u64,
-        value: u32,
-        size: u64,
-    ) -> bool;
+        pub unsafe fn write_memory(&self, handle: *mut FFIHandle, address: u64, buffer: *const u8, size: u64) -> Result<bool, String> {
+            let lib = &self._library;
+            let func: Symbol<FnWriteMemory> = lib.get(b"kdmapper_write_memory")
+                .map_err(|e| format!("Failed to get kdmapper_write_memory: {}", e))?;
+            Ok(func(handle, address, buffer, size))
+        }
 
-    /// Clear the MmUnloadedDrivers list (hide traces)
-    fn kdmapper_clear_unloaded_drivers(handle: *mut FFIHandle) -> bool;
+        pub unsafe fn set_memory(&self, handle: *mut FFIHandle, address: u64, value: u32, size: u64) -> Result<bool, String> {
+            let lib = &self._library;
+            let func: Symbol<FnSetMemory> = lib.get(b"kdmapper_set_memory")
+                .map_err(|e| format!("Failed to get kdmapper_set_memory: {}", e))?;
+            Ok(func(handle, address, value, size))
+        }
+
+        pub unsafe fn allocate_pool(&self, handle: *mut FFIHandle, pool_type: u32, size: u64) -> Result<u64, String> {
+            let lib = &self._library;
+            let func: Symbol<FnAllocatePool> = lib.get(b"kdmapper_allocate_pool")
+                .map_err(|e| format!("Failed to get kdmapper_allocate_pool: {}", e))?;
+            Ok(func(handle, pool_type, size))
+        }
+
+        pub unsafe fn free_pool(&self, handle: *mut FFIHandle, address: u64) -> Result<bool, String> {
+            let lib = &self._library;
+            let func: Symbol<FnFreePool> = lib.get(b"kdmapper_free_pool")
+                .map_err(|e| format!("Failed to get kdmapper_free_pool: {}", e))?;
+            Ok(func(handle, address))
+        }
+
+        pub unsafe fn map_driver(&self, handle: *mut FFIHandle, driver_path: *const c_char,
+            out_base_address: *mut u64, out_image_size: *mut u64, out_entry_point: *mut u64, out_status: *mut u32
+        ) -> Result<bool, String> {
+            let lib = &self._library;
+            let func: Symbol<FnMapDriver> = lib.get(b"kdmapper_map_driver")
+                .map_err(|e| format!("Failed to get kdmapper_map_driver: {}", e))?;
+            Ok(func(handle, driver_path, out_base_address, out_image_size, out_entry_point, out_status))
+        }
+
+        pub unsafe fn execute_shellcode(&self, handle: *mut FFIHandle, shellcode: *const u8, shellcode_size: u32, timeout_ms: u32, out_result: *mut u64) -> Result<bool, String> {
+            let lib = &self._library;
+            let func: Symbol<FnExecuteShellcode> = lib.get(b"kdmapper_execute_shellcode")
+                .map_err(|e| format!("Failed to get kdmapper_execute_shellcode: {}", e))?;
+            Ok(func(handle, shellcode, shellcode_size, timeout_ms, out_result))
+        }
+
+        pub unsafe fn get_module_base(&self, handle: *mut FFIHandle, module_name: *const c_char) -> Result<u64, String> {
+            let lib = &self._library;
+            let func: Symbol<FnGetModuleBase> = lib.get(b"kdmapper_get_module_base")
+                .map_err(|e| format!("Failed to get kdmapper_get_module_base: {}", e))?;
+            Ok(func(handle, module_name))
+        }
+
+        pub unsafe fn get_module_export(&self, handle: *mut FFIHandle, module_base: u64, function_name: *const c_char) -> Result<u64, String> {
+            let lib = &self._library;
+            let func: Symbol<FnGetModuleExport> = lib.get(b"kdmapper_get_module_export")
+                .map_err(|e| format!("Failed to get kdmapper_get_module_export: {}", e))?;
+            Ok(func(handle, module_base, function_name))
+        }
+
+        pub unsafe fn clear_unloaded_drivers(&self, handle: *mut FFIHandle) -> Result<bool, String> {
+            let lib = &self._library;
+            let func: Symbol<FnClearUnloadedDrivers> = lib.get(b"kdmapper_clear_unloaded_drivers")
+                .map_err(|e| format!("Failed to get kdmapper_clear_unloaded_drivers: {}", e))?;
+            Ok(func(handle))
+        }
+    }
+
+    // Global library instance (lazy loaded)
+    use std::sync::Mutex;
+    static LIBRARY: Mutex<Option<KDMapperLib>> = Mutex::new(None);
+
+    pub fn get_library() -> Result<&'static Mutex<Option<KDMapperLib>>, String> {
+        let mut lib = LIBRARY.lock().unwrap();
+        if lib.is_none() {
+            *lib = Some(KDMapperLib::load()?);
+        }
+        Ok(&LIBRARY)
+    }
+
+    // Wrapper functions that use the dynamic library
+    pub unsafe fn kdmapper_is_running() -> bool {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.is_running().unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub unsafe fn kdmapper_load_intel_driver(driver_path: *const c_char) -> *mut FFIHandle {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.load_intel_driver(driver_path).unwrap_or(std::ptr::null_mut())
+                } else {
+                    std::ptr::null_mut()
+                }
+            }
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    pub unsafe fn kdmapper_unload_intel_driver(handle: *mut FFIHandle) {
+        if let Ok(lib) = get_library() {
+            let lib_guard = lib.lock().unwrap();
+            if let Some(ref l) = *lib_guard {
+                let _ = l.unload_intel_driver(handle);
+            }
+        }
+    }
+
+    pub unsafe fn kdmapper_read_memory(handle: *mut FFIHandle, address: u64, buffer: *mut u8, size: u64) -> bool {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.read_memory(handle, address, buffer, size).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub unsafe fn kdmapper_write_memory(handle: *mut FFIHandle, address: u64, buffer: *const u8, size: u64) -> bool {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.write_memory(handle, address, buffer, size).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub unsafe fn kdmapper_set_memory(handle: *mut FFIHandle, address: u64, value: u32, size: u64) -> bool {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.set_memory(handle, address, value, size).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub unsafe fn kdmapper_allocate_pool(handle: *mut FFIHandle, pool_type: u32, size: u64) -> u64 {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.allocate_pool(handle, pool_type, size).unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            Err(_) => 0,
+        }
+    }
+
+    pub unsafe fn kdmapper_free_pool(handle: *mut FFIHandle, address: u64) -> bool {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.free_pool(handle, address).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub unsafe fn kdmapper_map_driver(handle: *mut FFIHandle, driver_path: *const c_char,
+        out_base_address: *mut u64, out_image_size: *mut u64, out_entry_point: *mut u64, out_status: *mut u32
+    ) -> bool {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.map_driver(handle, driver_path, out_base_address, out_image_size, out_entry_point, out_status).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub unsafe fn kdmapper_execute_shellcode(handle: *mut FFIHandle, shellcode: *const u8, shellcode_size: u32, timeout_ms: u32, out_result: *mut u64) -> bool {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.execute_shellcode(handle, shellcode, shellcode_size, timeout_ms, out_result).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub unsafe fn kdmapper_get_module_base(handle: *mut FFIHandle, module_name: *const c_char) -> u64 {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.get_module_base(handle, module_name).unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            Err(_) => 0,
+        }
+    }
+
+    pub unsafe fn kdmapper_get_module_export(handle: *mut FFIHandle, module_base: u64, function_name: *const c_char) -> u64 {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.get_module_export(handle, module_base, function_name).unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            Err(_) => 0,
+        }
+    }
+
+    pub unsafe fn kdmapper_clear_unloaded_drivers(handle: *mut FFIHandle) -> bool {
+        match get_library() {
+            Ok(lib) => {
+                let lib_guard = lib.lock().unwrap();
+                if let Some(ref l) = *lib_guard {
+                    l.clear_unloaded_drivers(handle).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+// Re-export dynamic_ffi functions for kdmapper-native mode
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_is_running;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_load_intel_driver;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_unload_intel_driver;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_read_memory;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_write_memory;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_set_memory;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_allocate_pool;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_free_pool;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_map_driver;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_execute_shellcode;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_get_module_base;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_get_module_export;
+#[cfg(feature = "kdmapper-native")]
+pub use dynamic_ffi::kdmapper_clear_unloaded_drivers;
+
+// Mock implementations for when kdmapper-native is NOT enabled
+// These are Rust functions that replace the C++ library for testing
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_is_running() -> bool {
+    false
+}
+
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_load_intel_driver(_driver_path: *const c_char) -> *mut FFIHandle {
+    std::ptr::null_mut()
+}
+
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_unload_intel_driver(_handle: *mut FFIHandle) {}
+
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_read_memory(
+    _handle: *mut FFIHandle,
+    _address: u64,
+    _buffer: *mut u8,
+    _size: u64,
+) -> bool {
+    false
+}
+
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_write_memory(
+    _handle: *mut FFIHandle,
+    _address: u64,
+    _buffer: *const u8,
+    _size: u64,
+) -> bool {
+    false
+}
+
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_allocate_pool(
+    _handle: *mut FFIHandle,
+    _pool_type: u32,
+    _size: u64,
+) -> u64 {
+    0
+}
+
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_free_pool(
+    _handle: *mut FFIHandle,
+    _address: u64,
+) -> bool {
+    false
+}
+
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_map_driver(
+    _handle: *mut FFIHandle,
+    _driver_path: *const c_char,
+    _out_base_address: *mut u64,
+    _out_image_size: *mut u64,
+    _out_entry_point: *mut u64,
+    _out_status: *mut u32,
+) -> bool {
+    false
+}
+
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_execute_shellcode(
+    _handle: *mut FFIHandle,
+    _shellcode: *const u8,
+    _shellcode_size: u32,
+    _timeout_ms: u32,
+    _out_result: *mut u64,
+) -> bool {
+    false
+}
+
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_get_module_base(
+    _handle: *mut FFIHandle,
+    _module_name: *const c_char,
+) -> u64 {
+    0
+}
+
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_get_module_export(
+    _handle: *mut FFIHandle,
+    _module_base: u64,
+    _function_name: *const c_char,
+) -> u64 {
+    0
+}
+
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_set_memory(
+    _handle: *mut FFIHandle,
+    _address: u64,
+    _value: u32,
+    _size: u64,
+) -> bool {
+    false
+}
+
+#[cfg(not(feature = "kdmapper-native"))]
+#[no_mangle]
+pub extern "C" fn kdmapper_clear_unloaded_drivers(_handle: *mut FFIHandle) -> bool {
+    false
 }
 
 // ============================================================================

@@ -16,7 +16,7 @@
 //! use urx_runtime_v08::*;
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 //!     // Create an IR graph
 //!     let mut graph = IRGraph::new();
 //!

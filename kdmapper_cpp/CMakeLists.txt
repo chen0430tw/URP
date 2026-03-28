@@ -4,8 +4,8 @@ project(kdmapper_wrapper CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# KDMapper source directory
-set(KDMAPPER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../kdmapper" CACHE PATH "Path to kdmapper source")
+# KDMapper source directory (absolute path since kdmapper is outside URP)
+set(KDMAPPER_DIR "C:/Users/Administrator/kdmapper/kdmapper" CACHE PATH "Path to kdmapper source")
 
 # Include directories
 include_directories(
@@ -29,11 +29,9 @@ set(KDMAPPER_SOURCES
 # Create the wrapper library
 add_library(kdmapper_cpp SHARED ${WRAPPER_SOURCES} ${KDMAPPER_SOURCES})
 
-# Set output name
+# Set output name - keep default extensions for Windows
 set_target_properties(kdmapper_cpp PROPERTIES
     OUTPUT_NAME "kdmapper_cpp"
-    PREFIX ""
-    SUFFIX ""
     POSITION_INDEPENDENT_CODE ON
 )
 
@@ -46,10 +44,14 @@ if(WIN32)
     )
 
     # Link Windows libraries
+    # Note: gdi32full and win32u are system DLLs loaded dynamically
     target_link_libraries(kdmapper_cpp
         gdi32
-        gdi32full
-        win32u
+        kernel32
+        user32
+        advapi32
+        shell32
+        ntdll
     )
 endif()
 

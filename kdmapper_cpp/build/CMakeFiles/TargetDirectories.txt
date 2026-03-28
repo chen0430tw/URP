@@ -1,0 +1,4 @@
+C:/Users/Administrator/URP/kdmapper_cpp/build/CMakeFiles/kdmapper_cpp.dir
+C:/Users/Administrator/URP/kdmapper_cpp/build/CMakeFiles/INSTALL.dir
+C:/Users/Administrator/URP/kdmapper_cpp/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/Administrator/URP/kdmapper_cpp/build/CMakeFiles/ZERO_CHECK.dir
