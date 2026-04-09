@@ -24,6 +24,10 @@ pub struct Node {
     pub memory_capacity: f32,
     pub bandwidth: f32,
     pub inertia_keys: Vec<String>,
+    /// TCP address for remote execution: "host:port" (e.g. "192.168.1.2:7788").
+    /// When set and host_id differs from the sending node, URXRuntime routes
+    /// packets over real TCP instead of the stub path.
+    pub address: Option<String>,
 }
 
 impl Node {
@@ -38,7 +42,14 @@ impl Node {
             memory_capacity: 1024.0,
             bandwidth: 1000.0,
             inertia_keys: Vec::new(),
+            address: None,
         }
+    }
+
+    /// Set the TCP address for remote routing.
+    pub fn with_address(mut self, addr: impl Into<String>) -> Self {
+        self.address = Some(addr.into());
+        self
     }
 
     pub fn has_tag(&self, tag: &str) -> bool {

@@ -74,6 +74,12 @@ pub enum Opcode {
     // ── F64: Type Conversion ──────────────────────────────────────
     F64ToI64,  // f64 → i64  (truncate)
     I64ToF64,  // i64 → f64
+
+    // ── ONNX Model Inference ──────────────────────────────────────
+    /// Run an ONNX model.  The String is the path to the .onnx file.
+    /// Inputs come from ctx keyed by ONNX input name (PayloadValue::Tensor).
+    /// Returns PayloadValue::Tensor (first model output).
+    OnnxInfer(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,5 +178,70 @@ impl IRGraph {
         let s = serde_json::to_string_pretty(self)?;
         std::fs::write(path, s)?;
         Ok(())
+    }
+
+    /// Build an `IRGraph` from an ONNX model file.
+    ///
+    /// # Graph structure
+    /// ```text
+    /// input_0 ──┐
+    /// input_1 ──┼──▶ onnx_infer(path) ──▶ (leaf, returns Tensor)
+    /// ...      ─┘
+    /// ```
+    ///
+    /// The `onnx_infer` block holds `Opcode::OnnxInfer(path)`.  At execution
+    /// time the `OnnxExecutor` (feature="onnx") picks it up and runs the model.
+    ///
+    /// Requires the `onnx` feature and a valid ONNX Runtime shared library at
+    /// runtime.  Without the feature this always returns `Err`.
+    pub fn from_onnx(model_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(feature = "onnx")]
+        {
+            use ort::Session;
+
+            // Open the session just long enough to introspect input/output names.
+            let session = Session::builder()?.commit_from_file(model_path)?;
+
+            let mut graph = IRGraph::with_id(
+                std::path::Path::new(model_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("onnx_graph")
+                    .to_string(),
+            );
+
+            // Create one placeholder block per model input.
+            let mut input_ids: Vec<String> = Vec::new();
+            for (i, inp) in session.inputs.iter().enumerate() {
+                let bid = format!("input_{}", i);
+                let mut b = IRBlock::new(&bid, Opcode::UConstI64(0));
+                b.output = inp.name.clone();
+                graph.blocks.push(b);
+                input_ids.push(bid);
+            }
+
+            // Create the single inference block.
+            let mut infer = IRBlock::new("onnx_infer", Opcode::OnnxInfer(model_path.to_string()));
+            infer.inputs = input_ids.clone();
+            infer.output = "onnx_output".to_string();
+            graph.blocks.push(infer);
+
+            // Wire edges: each input placeholder → inference block.
+            for (i, inp) in session.inputs.iter().enumerate() {
+                graph.edges.push(IREdge {
+                    src_block:   input_ids[i].clone(),
+                    dst_block:   "onnx_infer".to_string(),
+                    output_key:  "out".to_string(),
+                    input_key:   inp.name.clone(),
+                });
+            }
+
+            Ok(graph)
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            let _ = model_path;
+            Err("URX was built without the `onnx` feature. Rebuild with `--features onnx` and ensure onnxruntime is installed.".into())
+        }
     }
 }

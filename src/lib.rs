@@ -45,6 +45,7 @@ pub mod et_cooling;
 pub mod gpu_executor;
 pub mod executor;
 pub mod jit_compiler;
+pub mod onnx_executor;
 pub mod usb_executor;
 pub mod ir;
 pub mod node;
@@ -74,6 +75,7 @@ pub use kdmapper_ffi::{
 // Re-export commonly used types
 pub use cost::{node_score, route_cost};
 pub use executor::{BlockExecutor, CpuExecutor, eval_opcode, ExecutorRegistry, HardwareExecutor, ThreadPoolExecutor};
+pub use onnx_executor::OnnxExecutor;
 #[cfg(feature = "gpu")]
 pub use gpu_executor::{WgpuExecutor, JitBlockExecutor};
 pub use ir::{IRBlock, IREdge, IRGraph, MergeMode, Opcode};

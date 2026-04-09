@@ -12,7 +12,7 @@ use crate::packet::PayloadValue;
 // runtime's wave-based scheduler using tokio::task::spawn_blocking.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub trait HardwareExecutor: Send + Sync {
+pub trait HardwareExecutor: Send + Sync + 'static {
     /// Execute a single block given its resolved input context.
     fn exec(&self, block: &IRBlock, ctx: &HashMap<String, PayloadValue>) -> PayloadValue;
 
@@ -210,6 +210,7 @@ pub fn eval_opcode(block: &IRBlock, ctx: &HashMap<String, PayloadValue>) -> Payl
                 PayloadValue::F64(n) => n.to_string(),
                 PayloadValue::Str(s) => s.clone(),
                 PayloadValue::List(_) => panic!("UConcat: List input not supported"),
+                PayloadValue::Tensor(_, _) => panic!("UConcat: Tensor input not supported"),
             };
             let a = ctx.get(&block.inputs[0]).expect("missing input left");
             let b = ctx.get(&block.inputs[1]).expect("missing input right");
@@ -313,5 +314,14 @@ pub fn eval_opcode(block: &IRBlock, ctx: &HashMap<String, PayloadValue>) -> Payl
         // ── F64: Type Conversion ──────────────────────────────────────
         Opcode::F64ToI64 => PayloadValue::I64(f64_in(&block.inputs[0]) as i64),
         Opcode::I64ToF64 => PayloadValue::F64(i64_in(&block.inputs[0]) as f64),
+
+        // ── ONNX Model Inference ──────────────────────────────────────
+        Opcode::OnnxInfer(_path) => {
+            panic!(
+                "OnnxInfer blocks require OnnxExecutor. \
+                 Register it: runtime.executors.register(node_id, \
+                 Arc::new(OnnxExecutor::load(path).unwrap()))"
+            );
+        }
     }
 }

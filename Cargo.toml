@@ -20,6 +20,9 @@ wgpu = { version = "29", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.3", optional = true }
 serialport = { version = "4", optional = true }
+# ONNX Runtime integration (requires ORT shared library at runtime)
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic"], optional = true }
+ndarray = { version = "0.16", optional = true }
 
 [features]
 default = []
@@ -31,6 +34,8 @@ kdmapper-native = ["kdmapper", "libloading"]
 gpu = ["wgpu", "bytemuck", "pollster"]
 # USB device executor (serialport-backed + protocol framing)
 usb = ["serialport"]
+# ONNX model execution via ONNX Runtime (requires onnxruntime DLL in PATH or ORT_DYLIB_PATH)
+onnx = ["ort", "ndarray"]
 
 [dev-dependencies]
 tokio-test = "0.4"

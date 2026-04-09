@@ -26,16 +26,17 @@
 
 ## 3. 当前版本定位
 
-本包主线代码当前版本为 **v1.1**。  
+本包主线代码当前版本为 **v1.2**。  
 它已经具备：
 
 - IRGraph + JSON 序列化（serde 双向，文件 I/O）
 - block fusion
 - graph partition
 - partition-level binding
-- **PartitionDAGScheduler 完整集成**（DAG 拓扑调度 + AsyncLane 并行执行分区）
-- local ring fast path
-- remote packet path skeleton
+- **PartitionDAGScheduler 完整集成**（DAG 拓扑调度 + JoinSet 真正并发分区执行）
+- local direct fast path（同 host 跳过编解码）
+- **remote TCP 真实传输**（`RemotePacketLink::serve` + `Node::address` 路由）
+- **ONNX 模型推理**（`OnnxExecutor` + `Opcode::OnnxInfer` + `PayloadValue::Tensor`）
 - reducer trait
 - scheduler policy trait + ReservationAwarePolicy 示例
 - topology-aware cost model
@@ -104,15 +105,24 @@ Demo K 演示了 `ReservationAwarePolicy` 的实现方式。
 定义：
 
 - `Partition` — 含 `blocks`、`node_id`、`internal_order`
-- `AsyncLane` — 信号量限速执行 lane，接口为 `Fn(Partition) -> Fut`
-- `PartitionDAGScheduler` — Kahn 拓扑排序 + AsyncLane 分发
+- `AsyncLane` — 信号量限速执行 lane，`semaphore_arc()` 供跨任务捕获
+- `PartitionDAGScheduler` — O(E+B) DAG 构建 + JoinSet 并发分发
 
-**重要**：`AsyncLane::execute_partition` 的闭包签名是 partition 级的：
+**重要**：`HardwareExecutor: 'static`（v1.2 新增约束），`execute_dag_partitions` 要求：
 ```rust
-F: Fn(Partition) -> Fut,
-Fut: Future<Output = Vec<BlockExecutionResult>> + Send,
+F: Fn(Partition) -> Fut + Clone + Send + 'static,
+Fut: Future<Output = Vec<BlockExecutionResult>> + Send + 'static,
 ```
-不要把它改回 block 级签名——这是 v1.1 解决的兼容性问题。
+闭包捕获的所有值必须为 owned（Arc 等），不能持有引用。
+
+### `src/onnx_executor.rs`（v1.2 新增）
+- `OnnxExecutor::load(path)` — 预加载 ort::Session，feature="onnx" 时有效
+- `exec()` 遇 `OnnxInfer` 走真实推理；其余 opcode 委托 `eval_opcode`
+- 无 onnx feature 时 `load()` 返回 Err，`exec()` 遇 OnnxInfer 则 panic（明确提示）
+
+### `src/remote.rs`
+- `RemotePacketLink::serve(addr, handler)` — TCP 服务器入口
+- `Node::address: Option<String>` — 设置后 runtime 走真实 TCP 路由
 
 ### `src/runtime.rs`
 当前最重要文件之一。  

@@ -3,30 +3,48 @@ use std::collections::{HashMap, HashSet};
 use crate::ir::{IRBlock, IREdge, IRGraph};
 
 pub fn fuse_linear_blocks(graph: &IRGraph) -> IRGraph {
-    let mut used = HashSet::new();
+    // ── Pre-build O(1) lookup structures ────────────────────────────────────
+    // Block index: O(B) build, O(1) lookup (replaces O(B) `get_block` per call)
+    let block_map: HashMap<&str, &IRBlock> = graph.blocks.iter()
+        .map(|b| (b.block_id.as_str(), b))
+        .collect();
+
+    // Edge count map: (src, dst) → count, O(E) build, O(1) lookup
+    // Used to check whether exactly one edge connects a→b (fusion condition)
+    let mut edge_count: HashMap<(&str, &str), usize> = HashMap::new();
+    for e in &graph.edges {
+        *edge_count.entry((e.src_block.as_str(), e.dst_block.as_str())).or_insert(0) += 1;
+    }
+
+    // ── Fusion pass ──────────────────────────────────────────────────────────
+    let mut used  = HashSet::new();
     let mut new_blocks = Vec::new();
     let mut map: HashMap<String, String> = HashMap::new();
 
-    let ids: Vec<String> = graph.blocks.iter().map(|b| b.block_id.clone()).collect();
+    let ids: Vec<&str> = graph.blocks.iter().map(|b| b.block_id.as_str()).collect();
     let mut i = 0usize;
 
     while i < ids.len() {
-        let a_id = &ids[i];
+        let a_id = ids[i];
         if used.contains(a_id) {
             i += 1;
             continue;
         }
 
-        let a = graph.get_block(a_id).unwrap();
+        // O(1) block lookup (was O(B))
+        let a = block_map[a_id];
         let mut fused = false;
 
         if i + 1 < ids.len() {
-            let b_id = &ids[i + 1];
+            let b_id = ids[i + 1];
             if !used.contains(b_id) {
-                let b = graph.get_block(b_id).unwrap();
-                let direct_edges: Vec<_> = graph.edges.iter()
-                    .filter(|e| e.src_block == *a_id && e.dst_block == *b_id)
-                    .collect();
+                let b = block_map[b_id];
+
+                // O(1) edge-count check (was O(E) filter)
+                let direct_count = edge_count
+                    .get(&(a_id, b_id))
+                    .copied()
+                    .unwrap_or(0);
 
                 // Only fuse when b needs no external inputs. If b has inputs,
                 // they are named slots that must be filled via the inbox. After
@@ -35,7 +53,7 @@ pub fn fuse_linear_blocks(graph: &IRGraph) -> IRGraph {
                 let compatible = a.resource_shape == b.resource_shape
                     && a.required_tag == b.required_tag
                     && a.preferred_zone == b.preferred_zone
-                    && direct_edges.len() == 1
+                    && direct_count == 1
                     && b.inputs.is_empty();
 
                 if compatible {
@@ -53,45 +71,44 @@ pub fn fuse_linear_blocks(graph: &IRGraph) -> IRGraph {
                         estimated_duration: a.estimated_duration + b.estimated_duration,
                     };
                     new_blocks.push(fused_block);
-                    used.insert(a_id.clone());
-                    used.insert(b_id.clone());
-                    map.insert(a_id.clone(), fused_id.clone());
-                    map.insert(b_id.clone(), fused_id);
+                    used.insert(a_id);
+                    used.insert(b_id);
+                    map.insert(a.block_id.clone(), fused_id.clone());
+                    map.insert(b.block_id.clone(), fused_id);
                     fused = true;
                 }
             }
         }
 
         if !fused {
-            new_blocks.push(a.clone());
-            used.insert(a_id.clone());
-            map.insert(a_id.clone(), a_id.clone());
+            new_blocks.push((*a).clone());
+            used.insert(a_id);
+            map.insert(a.block_id.clone(), a.block_id.clone());
         }
 
         i += 1;
     }
 
+    // ── Remap edges, dedup in O(E) using HashSet ─────────────────────────────
+    // Old code used `new_edges.iter().any(...)` → O(E²) worst case.
+    // HashSet key = (src, dst, output_key, input_key) → O(E) total.
     let mut new_edges = Vec::new();
+    let mut seen: HashSet<(String, String, String, String)> = HashSet::new();
+
     for e in &graph.edges {
-        let s = map.get(&e.src_block).unwrap().clone();
-        let d = map.get(&e.dst_block).unwrap().clone();
+        let s = map[&e.src_block].clone();
+        let d = map[&e.dst_block].clone();
         if s == d {
-            continue;
+            continue; // intra-fused edge: discard
         }
-        let candidate = IREdge {
-            src_block: s,
-            dst_block: d,
-            output_key: e.output_key.clone(),
-            input_key: e.input_key.clone(),
-        };
-        let exists = new_edges.iter().any(|x: &IREdge|
-            x.src_block == candidate.src_block &&
-            x.dst_block == candidate.dst_block &&
-            x.output_key == candidate.output_key &&
-            x.input_key == candidate.input_key
-        );
-        if !exists {
-            new_edges.push(candidate);
+        let key = (s.clone(), d.clone(), e.output_key.clone(), e.input_key.clone());
+        if seen.insert(key) {
+            new_edges.push(IREdge {
+                src_block:  s,
+                dst_block:  d,
+                output_key: e.output_key.clone(),
+                input_key:  e.input_key.clone(),
+            });
         }
     }
 

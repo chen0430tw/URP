@@ -71,14 +71,17 @@ pub enum PayloadValue {
     F64(f64),
     Str(String),
     List(Vec<PayloadValue>),
+    /// Float32 tensor: (flat row-major data, shape dimensions)
+    Tensor(Vec<f32>, Vec<usize>),
 }
 
 pub struct PayloadCodec;
 
 impl PayloadCodec {
-    const TYPE_I64: u8 = 1;
-    const TYPE_STR: u8 = 2;
-    const TYPE_F64: u8 = 4;
+    const TYPE_I64:    u8 = 1;
+    const TYPE_STR:    u8 = 2;
+    const TYPE_F64:    u8 = 4;
+    const TYPE_TENSOR: u8 = 5;
 
     pub fn encode(value: &PayloadValue) -> Vec<u8> {
         match value {
@@ -110,6 +113,20 @@ impl PayloadCodec {
                     let encoded = Self::encode(item);
                     out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
                     out.extend_from_slice(&encoded);
+                }
+                out
+            }
+            PayloadValue::Tensor(data, shape) => {
+                // TYPE_TENSOR | ndim(4B LE) | shape[i](4B LE)... | f32 data (4B LE each)
+                let ndim = shape.len() as u32;
+                let mut out = Vec::with_capacity(1 + 4 + ndim as usize * 4 + data.len() * 4);
+                out.push(Self::TYPE_TENSOR);
+                out.extend_from_slice(&ndim.to_le_bytes());
+                for &d in shape {
+                    out.extend_from_slice(&(d as u32).to_le_bytes());
+                }
+                for &v in data {
+                    out.extend_from_slice(&v.to_le_bytes());
                 }
                 out
             }
@@ -151,7 +168,28 @@ impl PayloadCodec {
                 }
                 PayloadValue::List(items)
             }
-            _ => panic!("unknown payload type"),
+            Self::TYPE_TENSOR => {
+                let mut ndim_b = [0u8; 4];
+                ndim_b.copy_from_slice(&bytes[1..5]);
+                let ndim = u32::from_le_bytes(ndim_b) as usize;
+                let mut shape = Vec::with_capacity(ndim);
+                let mut pos = 5;
+                for _ in 0..ndim {
+                    let mut d = [0u8; 4];
+                    d.copy_from_slice(&bytes[pos..pos + 4]);
+                    shape.push(u32::from_le_bytes(d) as usize);
+                    pos += 4;
+                }
+                let n_elems = shape.iter().copied().product::<usize>().max(1);
+                let mut data = Vec::with_capacity(n_elems);
+                for i in 0..n_elems {
+                    let mut f = [0u8; 4];
+                    f.copy_from_slice(&bytes[pos + i * 4..pos + i * 4 + 4]);
+                    data.push(f32::from_le_bytes(f));
+                }
+                PayloadValue::Tensor(data, shape)
+            }
+            _ => panic!("unknown payload type: {}", bytes[0]),
         }
     }
 }

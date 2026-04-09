@@ -1,6 +1,45 @@
 # URX Changelog
 
-## v1.1（当前）
+## v1.2（当前）
+
+### 真实网络传输（RemotePacketLink TCP 实现）
+- `RemotePacketLink::serve(addr, handler)` — tokio TCP 服务器，每连接独立 `tokio::spawn`，`PacketCodec` 帧封装（4 字节 BE 长度前缀）
+- `runtime.rs` 远程路由修复：`dst_node.address` 有值时走真实 TCP（`remote.send(addr, packet)`），无地址时退回桩实现
+- `Node::address: Option<String>` — 节点 TCP 端点字段（`with_address()` builder）
+- 借用生命周期修复：`src_n`/`dst_n` 引用在 `.await` 前归还，`dst_addr` 提前 `.clone()` 解耦
+
+### 真实 ONNX 模型推理
+- `src/onnx_executor.rs`（新文件）：`OnnxExecutor::load(path)` 构建时预加载 `ort::Session`，`exec()` 遇 `OnnxInfer` 走真实推理，其余 opcode 委托 `eval_opcode`
+- `Opcode::OnnxInfer(String)` — ONNX 路径 opcode（`ir.rs`）
+- `PayloadValue::Tensor(Vec<f32>, Vec<usize>)` — 扁平行优先 f32 张量（`packet.rs`），`PayloadCodec` 支持 TYPE_TENSOR=5 编解码
+- `IRGraph::from_onnx(path)` — 通过 `ort::Session` 自省输入名称，自动构建「占位输入 → 推理块」计算图
+- `CpuExecutor` 遇 `OnnxInfer` 给出明确 panic 提示
+- Cargo.toml：`ort = "2.0.0-rc.12"` + `ndarray = "0.16"`，feature `onnx = ["ort", "ndarray"]`
+
+### 算法与传递逻辑全面优化
+
+#### `scheduler.rs` — 并发执行 + O(E+B) DAG 构建
+- `build_partition_dag`：O(P×B×E) → O(E+B)，一次扫全部 edges 建依赖图，替代对每个 partition 调用 `external_inputs()`
+- `execute_dag_partitions`：串行 await → **真正并发**，用 `tokio::task::JoinSet` 同时 spawn 所有就绪 partition；任意一个完成即解锁后继，无 wave 级同步屏障
+- `AsyncLane::semaphore_arc()` — 暴露 `Arc<Semaphore>` 供跨任务捕获
+- `HardwareExecutor: 'static` — `JoinSet::spawn` 所需约束
+
+#### `optimizer.rs` — 三处 O(1) 优化
+| 原来 | 现在 |
+|------|------|
+| `graph.get_block(id)` O(B) 线性扫 | 预建 `block_map: HashMap<&str, &IRBlock>`，O(1) |
+| `edges.iter().filter(src==a && dst==b)` O(E) 过滤 | 预建 `edge_count: HashMap<(&str,&str), usize>`，O(1) |
+| `new_edges.iter().any(...)` 去重 O(E²) | `HashSet<(src,dst,out_key,in_key)>` 去重 O(E) |
+
+#### `partition.rs` — O(B²) → O(B)
+- `bind_partitions` 预建 `block_index: HashMap<&str, &IRBlock>`，`get_block` O(B) 扫描改为 O(1) 查找
+
+#### `scheduler.rs`（`external_inputs` 局部优化）
+- 改为先建 `my_blocks: HashSet`，再对 edges 过滤 dst，避免嵌套全量扫描
+
+---
+
+## v1.1
 
 ### PartitionDAGScheduler 完整集成
 - `PartitionDAGScheduler` 从死代码升级为 `URXRuntime::execute_graph()` 的核心调度层

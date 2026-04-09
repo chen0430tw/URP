@@ -91,5 +91,8 @@ fn render_value(v: &PayloadValue) -> String {
             let parts: Vec<String> = items.iter().map(render_value).collect();
             format!("[{}]", parts.join(", "))
         }
+        PayloadValue::Tensor(data, shape) => {
+            format!("Tensor{shape:?}[{} elements]", data.len())
+        }
     }
 }

@@ -336,6 +336,9 @@ fn infer_type(opcode: &Opcode, _known: &HashMap<String, ShaderType>) -> ShaderTy
 
         Opcode::UConstStr(_) | Opcode::UI64ToStr | Opcode::UStrToI64 |
         Opcode::UStrLen | Opcode::UStrSlice | Opcode::UStrSplit => ShaderType::I32,
+
+        // OnnxInfer produces a tensor; shader-type is not applicable for GPU JIT
+        Opcode::OnnxInfer(_) => ShaderType::F32,
     }
 }
 

@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 /// A partition with its blocks and execution metadata
 #[derive(Debug, Clone)]
@@ -32,26 +33,24 @@ impl Partition {
         }
     }
 
-    /// Get input dependencies for this partition (edges from outside the partition)
+    /// Get input dependencies for this partition (edges from outside the partition).
+    /// Used by callers that need per-partition dependency info; the scheduler uses
+    /// the faster bulk `build_partition_dag` path instead.
     pub fn external_inputs(&self, graph: &IRGraph, partition_map: &HashMap<String, String>) -> HashSet<String> {
-        let mut inputs = HashSet::new();
-        let my_partitions: HashSet<String> = self.blocks.iter()
-            .map(|b| partition_map.get(&b.block_id).cloned().unwrap_or_default())
-            .collect();
+        let my_blocks: HashSet<&str> = self.blocks.iter().map(|b| b.block_id.as_str()).collect();
 
-        for block in &self.blocks {
-            for edge in &graph.edges {
-                if edge.dst_block == block.block_id {
-                    let src_partition = partition_map.get(&edge.src_block);
-                    if let Some(sp) = src_partition {
-                        if !my_partitions.contains(sp) && sp != &self.partition_id {
-                            inputs.insert(edge.src_block.clone());
-                        }
-                    }
+        // Pre-filter edges to only those whose dst is in this partition
+        graph.edges.iter()
+            .filter(|e| my_blocks.contains(e.dst_block.as_str()))
+            .filter_map(|e| {
+                let src_pid = partition_map.get(&e.src_block)?;
+                if src_pid != &self.partition_id {
+                    Some(e.src_block.clone())
+                } else {
+                    None
                 }
-            }
-        }
-        inputs
+            })
+            .collect()
     }
 
     /// Get outputs from this partition
@@ -61,15 +60,7 @@ impl Partition {
 }
 
 /// Compute internal topological order for blocks within a partition.
-///
-/// Uses the blocks' natural insertion order as a stable baseline.
-/// The actual cross-block dependencies within a partition are resolved at
-/// runtime via `intra_partition_topo` in runtime.rs, which has access to the
-/// full IRGraph edges. This function is kept for the `Partition` struct field
-/// and for callers that don't have graph access.
 fn compute_internal_order(blocks: &[IRBlock]) -> Vec<String> {
-    // Return block IDs in their given order (already topologically consistent
-    // if blocks were added via partition_graph which iterates the fused graph).
     blocks.iter().map(|b| b.block_id.clone()).collect()
 }
 
@@ -78,10 +69,6 @@ fn compute_internal_order(blocks: &[IRBlock]) -> Vec<String> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Async execution lane for running partitions concurrently.
-///
-/// Each lane has a semaphore limiting concurrency. The caller provides a
-/// closure `F: Fn(Partition) -> Fut` that is fully responsible for block-level
-/// execution, inbox management, and inter-block value routing.
 pub struct AsyncLane {
     semaphore: Arc<Semaphore>,
 }
@@ -93,11 +80,12 @@ impl AsyncLane {
         }
     }
 
+    /// Return a cloned Arc of the semaphore so it can be moved into spawned tasks.
+    pub fn semaphore_arc(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.semaphore)
+    }
+
     /// Execute a partition, returning results for all its blocks.
-    ///
-    /// The `executor` closure owns the execution logic: it reads inbox state,
-    /// runs each block, routes outputs to downstream inboxes, and returns one
-    /// `BlockExecutionResult` per block in the partition.
     pub async fn execute_partition<F, Fut>(
         &self,
         partition: Partition,
@@ -116,18 +104,7 @@ impl AsyncLane {
 // PartitionDAGScheduler
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// DAG-ordered partition scheduler.
-///
-/// Builds an inter-partition dependency graph from `Partition::external_inputs`,
-/// then executes partitions in topological order via `AsyncLane`s.
-///
-/// The caller provides the block-level execution logic as a closure:
-/// ```text
-/// F: Fn(Partition) -> impl Future<Output = Vec<BlockExecutionResult>>
-/// ```
-/// This closure is called once per partition and is responsible for executing
-/// every block within that partition (including inbox reads and output routing).
-/// `URXRuntime::execute_graph` uses this scheduler internally.
+/// DAG-ordered partition scheduler with concurrent wave execution.
 pub struct PartitionDAGScheduler {
     pub lanes: Vec<AsyncLane>,
 }
@@ -140,11 +117,6 @@ impl PartitionDAGScheduler {
         Self { lanes }
     }
 
-    /// Schedule and execute partitions following DAG dependencies.
-    ///
-    /// Partitions are ordered by `Partition::external_inputs` dependencies, then
-    /// dispatched to `AsyncLane`s in topological order. Returns a flat
-    /// `Vec<BlockExecutionResult>` for all blocks across all partitions.
     pub async fn schedule_and_execute<F, Fut>(
         &self,
         partitions: Vec<Partition>,
@@ -153,8 +125,8 @@ impl PartitionDAGScheduler {
         executor: F,
     ) -> Vec<BlockExecutionResult>
     where
-        F: Fn(Partition) -> Fut + Clone,
-        Fut: std::future::Future<Output = Vec<BlockExecutionResult>> + Send,
+        F: Fn(Partition) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = Vec<BlockExecutionResult>> + Send + 'static,
     {
         let (partition_dag, partition_index) =
             self.build_partition_dag(&partitions, graph, partition_map);
@@ -164,37 +136,58 @@ impl PartitionDAGScheduler {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    /// Build a dependency map: partition_id → [partition_ids it depends on].
+    /// Build a dependency map in O(E + B):
+    /// partition_id → [partition_ids it depends on].
+    ///
+    /// Old implementation called `Partition::external_inputs` (O(B_p × E)) for
+    /// every partition, giving O(P × B_avg × E) total.  New implementation
+    /// scans all edges exactly once → O(E) build + O(B) index → O(E + B).
     fn build_partition_dag(
         &self,
         partitions: &[Partition],
         graph: &IRGraph,
         partition_map: &HashMap<String, String>,
     ) -> (HashMap<String, Vec<String>>, HashMap<String, usize>) {
-        let mut partition_index = HashMap::new();
+        // O(P): per-partition index and empty dep-sets
+        let mut partition_index: HashMap<String, usize> = HashMap::with_capacity(partitions.len());
+        let mut dag: HashMap<String, HashSet<String>> = HashMap::with_capacity(partitions.len());
         for (idx, p) in partitions.iter().enumerate() {
             partition_index.insert(p.partition_id.clone(), idx);
+            dag.insert(p.partition_id.clone(), HashSet::new());
         }
 
-        let mut dag: HashMap<String, Vec<String>> = HashMap::new();
-        for p in partitions {
-            let deps = p.external_inputs(graph, partition_map);
-            let dep_partitions: HashSet<String> = deps
-                .iter()
-                .filter_map(|bid| partition_map.get(bid))
-                .filter(|pid| *pid != &p.partition_id)
-                .cloned()
-                .collect();
-            dag.insert(p.partition_id.clone(), dep_partitions.into_iter().collect());
+        // O(E): scan every edge once
+        // If src and dst are in different partitions → dst_partition depends on src_partition
+        for edge in &graph.edges {
+            if let (Some(src_pid), Some(dst_pid)) = (
+                partition_map.get(&edge.src_block),
+                partition_map.get(&edge.dst_block),
+            ) {
+                if src_pid != dst_pid {
+                    dag.entry(dst_pid.clone())
+                        .or_default()
+                        .insert(src_pid.clone());
+                }
+            }
         }
+
+        // Convert HashSet → Vec for downstream use
+        let dag: HashMap<String, Vec<String>> = dag
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect();
 
         (dag, partition_index)
     }
 
-    /// Execute partitions in DAG topological order, collecting all results.
+    /// Execute partitions in DAG topological order with **concurrent** dispatch.
     ///
-    /// **OPTIMIZED**: Uses reverse dependency graph to achieve O(P + E) complexity
-    /// instead of O(P²) where P = partitions, E = edges.
+    /// Key improvements over the previous serial implementation:
+    /// - All partitions in the ready queue are launched concurrently via
+    ///   `tokio::task::JoinSet` rather than awaited one at a time.
+    /// - As soon as any partition finishes, its successors enter the ready queue
+    ///   and are immediately launched — no wave-level synchronisation barrier.
+    /// - Reverse dependency graph gives O(D_out) dependent updates vs O(P) scan.
     async fn execute_dag_partitions<F, Fut>(
         &self,
         partitions: Vec<Partition>,
@@ -203,93 +196,98 @@ impl PartitionDAGScheduler {
         executor: F,
     ) -> Vec<BlockExecutionResult>
     where
-        F: Fn(Partition) -> Fut + Clone,
-        Fut: std::future::Future<Output = Vec<BlockExecutionResult>> + Send,
+        F: Fn(Partition) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = Vec<BlockExecutionResult>> + Send + 'static,
     {
         let total_start = Instant::now();
-
-        // ── Step 1: Build reverse dependency graph (OPTIMIZATION) ─────────────
-        // partition_id -> [partition_ids that depend on it]
-        // Complexity: O(P × D), one-time cost
-        let reverse_deps_start = Instant::now();
-        let mut reverse_deps: HashMap<String, Vec<String>> = HashMap::new();
-        for (pid, deps) in &dag {
-            for dep_pid in deps {
-                reverse_deps.entry(dep_pid.clone())
-                    .or_insert_with(Vec::new)
-                    .push(pid.clone());
-            }
-        }
-        let reverse_deps_time = reverse_deps_start.elapsed();
-
-        // ── Step 2: Compute Kahn in-degrees ───────────────────────────────────
-        let init_start = Instant::now();
-        let mut in_degree: HashMap<String, usize> = HashMap::new();
-        let mut partition_store: HashMap<String, Partition> = HashMap::new();
         let total_partitions = partitions.len();
 
+        // ── Build reverse dependency graph O(P × D_avg) ──────────────────────
+        // reverse_deps[pid] = list of partitions that become ready when pid finishes
+        let mut reverse_deps: HashMap<String, Vec<String>> = HashMap::with_capacity(partitions.len());
+        for (pid, deps) in &dag {
+            for dep in deps {
+                reverse_deps.entry(dep.clone()).or_default().push(pid.clone());
+            }
+        }
+
+        // ── Init in-degrees and partition store ──────────────────────────────
+        let mut in_degree: HashMap<String, usize> = HashMap::with_capacity(total_partitions);
+        let mut partition_store: HashMap<String, Partition> = HashMap::with_capacity(total_partitions);
+
         for p in &partitions {
-            let deps = dag.get(&p.partition_id).map(|v| v.len()).unwrap_or(0);
-            in_degree.insert(p.partition_id.clone(), deps);
+            in_degree.insert(
+                p.partition_id.clone(),
+                dag.get(&p.partition_id).map(|v| v.len()).unwrap_or(0),
+            );
         }
         for p in partitions {
             partition_store.insert(p.partition_id.clone(), p);
         }
 
+        // Seed the ready queue with zero-in-degree partitions
         let mut ready: VecDeque<String> = in_degree
             .iter()
             .filter(|(_, &d)| d == 0)
             .map(|(id, _)| id.clone())
             .collect();
 
-        let mut completed: HashSet<String> = HashSet::new();
-        let mut all_results: Vec<BlockExecutionResult> = Vec::with_capacity(partition_store.len());
-        let init_time = init_start.elapsed();
+        let mut completed: HashSet<String> = HashSet::with_capacity(total_partitions);
+        let mut all_results: Vec<BlockExecutionResult> = Vec::with_capacity(total_partitions);
 
-        // ── Step 3: Execute partitions in topological order ───────────────────
-        let execute_start = Instant::now();
-        let mut total_update_time = std::time::Duration::ZERO;
-        let mut total_execute_time = std::time::Duration::ZERO;
+        // ── Concurrent execution loop ─────────────────────────────────────────
+        // JoinSet drives all ready partitions concurrently.  As each finishes its
+        // successors are enqueued and launched in the next pass of the outer loop.
+        let mut in_flight: JoinSet<(String, Vec<BlockExecutionResult>)> = JoinSet::new();
 
-        while let Some(partition_id) = ready.pop_front() {
-            let partition = partition_store.remove(&partition_id).unwrap();
+        loop {
+            // Launch every partition currently in the ready queue
+            while let Some(pid) = ready.pop_front() {
+                let partition = partition_store.remove(&pid).unwrap();
+                let exec     = executor.clone();
+                let lane_idx = *partition_index.get(&pid).unwrap_or(&0) % self.lanes.len();
+                let sem      = self.lanes[lane_idx].semaphore_arc();
 
-            let exec_start = Instant::now();
-            let lane_idx = *partition_index.get(&partition_id).unwrap_or(&0) % self.lanes.len();
-            let block_results = self.lanes[lane_idx]
-                .execute_partition(partition, executor.clone())
-                .await;
-            total_execute_time += exec_start.elapsed();
+                in_flight.spawn(async move {
+                    let _permit = sem.acquire_owned().await.unwrap();
+                    let results = exec(partition).await;
+                    (pid, results)
+                });
+            }
+
+            // If nothing is in-flight we're done
+            if in_flight.is_empty() {
+                break;
+            }
+
+            // Wait for any ONE partition to finish
+            let (finished_pid, block_results) = in_flight
+                .join_next()
+                .await
+                .unwrap()  // JoinSet never returns None while non-empty
+                .expect("partition task panicked");
+
             all_results.extend(block_results);
-            completed.insert(partition_id.clone());
+            completed.insert(finished_pid.clone());
 
-            // OPTIMIZED: use reverse dependency graph, O(D_incoming) instead of O(P)
-            let update_start = Instant::now();
-            if let Some(deps) = reverse_deps.get(&partition_id) {
-                for dep_pid in deps {
-                    if let Some(deg) = in_degree.get_mut(dep_pid) {
+            // O(D_out): decrement in-degree of direct successors only
+            if let Some(successors) = reverse_deps.get(&finished_pid) {
+                for succ in successors {
+                    if let Some(deg) = in_degree.get_mut(succ) {
                         *deg -= 1;
-                        if *deg == 0 && !completed.contains(dep_pid) {
-                            ready.push_back(dep_pid.clone());
+                        if *deg == 0 && !completed.contains(succ) {
+                            ready.push_back(succ.clone());
                         }
                     }
                 }
             }
-            total_update_time += update_start.elapsed();
         }
 
-        let execute_time = execute_start.elapsed();
-        let total_time = total_start.elapsed();
-
-        eprintln!("PartitionDAGScheduler performance stats:");
-        eprintln!("  Partitions: {}", total_partitions);
-        eprintln!("  Total time: {:?}", total_time);
-        eprintln!("    - Reverse deps build: {:?}", reverse_deps_time);
-        eprintln!("    - Initialization: {:?}", init_time);
-        eprintln!("    - Execution loop: {:?}", execute_time);
-        eprintln!("      - Partition execution: {:?}", total_execute_time);
-        eprintln!("      - Dependency update: {:?}", total_update_time);
-        eprintln!("  Avg time per partition: {:?}", total_time / total_partitions.max(1) as u32);
+        eprintln!(
+            "[PartitionDAGScheduler] {} partitions completed in {:?}",
+            total_partitions,
+            total_start.elapsed()
+        );
 
         all_results
     }

@@ -212,7 +212,68 @@ impl Default for RemotePacketLink {
 impl RemotePacketLink {
     pub async fn send_legacy(&mut self, packet: URPPacket) -> URPPacket {
         self.sent_packets += 1;
-        // For legacy compatibility, just return the packet
+        // Stub: no address configured, pass packet through unchanged.
         packet
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TCP server — receive URPPackets, process them, send back responses
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl RemotePacketLink {
+    /// Start a TCP server at `addr` that processes incoming `URPPacket`s with
+    /// the provided `handler` closure and sends the returned packet back as the
+    /// response.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use urx_runtime_v08::remote::RemotePacketLink;
+    /// use urx_runtime_v08::packet::{PayloadCodec, PayloadValue, URPPacket};
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     RemotePacketLink::serve("0.0.0.0:7788", |pkt| {
+    ///         // Echo the packet back unchanged (real impl would exec the opcode)
+    ///         pkt
+    ///     }).await.unwrap();
+    /// }
+    /// ```
+    pub async fn serve<F>(addr: &str, handler: F) -> Result<(), std::io::Error>
+    where
+        F: Fn(URPPacket) -> URPPacket + Send + Sync + 'static + Clone,
+    {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind(addr).await?;
+        eprintln!("[RemotePacketLink] Listening on {}", addr);
+
+        loop {
+            let (stream, peer) = listener.accept().await?;
+            eprintln!("[RemotePacketLink] Connection from {}", peer);
+            let handler = handler.clone();
+            let config = LinkConfig::default();
+
+            tokio::spawn(async move {
+                let mut framed = Framed::new(stream, PacketCodec::new(config.max_frame_size));
+                while let Some(frame) = framed.next().await {
+                    match frame {
+                        Ok(bytes) => match URPPacket::from_bytes(&bytes) {
+                            Ok(packet) => {
+                                let response = handler(packet);
+                                if let Err(e) = framed.send(response.to_bytes()).await {
+                                    eprintln!("[RemotePacketLink] Send error: {e}");
+                                    break;
+                                }
+                            }
+                            Err(e) => eprintln!("[RemotePacketLink] Decode error: {e}"),
+                        },
+                        Err(e) => {
+                            eprintln!("[RemotePacketLink] Frame error: {e}");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
     }
 }

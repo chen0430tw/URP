@@ -337,10 +337,17 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
 
                         for e in edges {
                             let dst_node = bb.get(&e.dst_block).unwrap().clone();
-                            let src_n = nodes_s.get(&node_id).unwrap();
-                            let dst_n = nodes_s.get(&dst_node).unwrap();
-                            let is_local = src_n.host_id == dst_n.host_id;
-                            let cost     = route_cost(src_n, dst_n);
+                            // Borrow src/dst only long enough to extract owned values
+                            // so no references cross the .await below.
+                            let (is_local, cost, dst_addr) = {
+                                let src_n = nodes_s.get(&node_id).unwrap();
+                                let dst_n = nodes_s.get(&dst_node).unwrap();
+                                (
+                                    src_n.host_id == dst_n.host_id,
+                                    route_cost(src_n, dst_n),
+                                    dst_n.address.clone(),
+                                )
+                            };
 
                             // OPTIMIZATION: same-host routing skips encode/ring/decode entirely
                             let recv_value = if is_local {
@@ -350,7 +357,16 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
                                 let packet  = URPPacket::build(
                                     6, block.merge_mode, &e.src_block, &e.dst_block, &payload,
                                 );
-                                let recv = remote_c.lock().await.send_legacy(packet).await;
+                                // Real TCP when dst_node has a configured address; stub otherwise
+                                let recv = if let Some(ref addr) = dst_addr {
+                                    remote_c.lock().await
+                                        .send(addr, packet).await
+                                        .unwrap_or_else(|err| panic!(
+                                            "TCP send to {addr} failed: {err}"
+                                        ))
+                                } else {
+                                    remote_c.lock().await.send_legacy(packet).await
+                                };
                                 PayloadCodec::decode(recv.payload())
                             };
 

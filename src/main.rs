@@ -178,6 +178,7 @@ async fn demo_a() {
             memory_capacity: 32.0,
             bandwidth: 10.0,
             inertia_keys: vec![],
+            address: None,
         },
     ];
 
@@ -294,6 +295,7 @@ async fn demo_b() {
             memory_capacity: 32.0,
             bandwidth: 10.0,
             inertia_keys: vec!["sum_path".into()],
+            address: None,
         },
         Node {
             node_id: "gpu0".into(),
@@ -305,6 +307,7 @@ async fn demo_b() {
             memory_capacity: 64.0,
             bandwidth: 25.0,
             inertia_keys: vec!["concat_path".into()],
+            address: None,
         },
     ];
 
@@ -407,6 +410,7 @@ async fn demo_c() {
             memory_capacity: 16.0,
             bandwidth: 5.0,
             inertia_keys: vec![],
+            address: None,
         },
     ];
 
@@ -511,6 +515,7 @@ async fn demo_d() {
             memory_capacity: 32.0,
             bandwidth: 10.0,
             inertia_keys: vec![],
+            address: None,
         },
     ];
 
@@ -637,6 +642,7 @@ async fn demo_e() {
                     memory_capacity: 8192.0,
                     bandwidth: 500.0,
                     inertia_keys: vec![],
+            address: None,
                 },
             ];
 
@@ -773,6 +779,7 @@ async fn demo_f() {
         memory_capacity: 32.0,
         bandwidth: 50.0,
         inertia_keys: vec![],
+            address: None,
     }).collect();
 
     let policy = MultifactorPolicy { reservation_bias: 1.0 };
@@ -880,6 +887,7 @@ async fn demo_g() {
         host_id: "host0".into(), zone: "z1".into(),
         tags: vec!["gpu".into()], compute_capacity: 100.0,
         memory_capacity: 8192.0, bandwidth: 500.0, inertia_keys: vec![],
+            address: None,
     }];
     let policy = MultifactorPolicy { reservation_bias: 1.0 };
     let mut rt = URXRuntime::new(nodes, policy);
@@ -1206,6 +1214,7 @@ async fn demo_j() {
         host_id: "host0".into(), zone: "z1".into(),
         tags: vec!["cpu".into()], compute_capacity: 4.0,
         memory_capacity: 8.0, bandwidth: 5.0, inertia_keys: vec![],
+            address: None,
     }];
     let policy = MultifactorPolicy { reservation_bias: 1.0 };
     let mut rt = URXRuntime::new(nodes, policy);
@@ -1367,6 +1376,7 @@ async fn demo_l() {
         memory_capacity:  64.0,
         bandwidth:        20.0,
         inertia_keys:     vec![],
+        address:          None,
     }).collect();
 
     for (filename, label) in &graphs_to_run {
