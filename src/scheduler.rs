@@ -5,13 +5,11 @@
 //! - Partitions之间的依赖形成DAG，可以并行执行
 //! - Async execution lanes handle concurrent partition execution
 
-use crate::ir::{IRBlock, IRGraph, MergeMode};
-use crate::policy::SchedulerPolicy;
-use crate::runtime::{BlockExecutionResult, RuntimeResult};
+use crate::ir::{IRGraph, IRBlock};
+use crate::runtime::BlockExecutionResult;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
-use tokio::task::JoinSet;
+use tokio::sync::Semaphore;
 
 /// A partition with its blocks and execution metadata
 #[derive(Debug, Clone)]
@@ -61,107 +59,76 @@ impl Partition {
     }
 }
 
-/// Compute internal topological order for blocks within a partition
+/// Compute internal topological order for blocks within a partition.
+///
+/// Uses the blocks' natural insertion order as a stable baseline.
+/// The actual cross-block dependencies within a partition are resolved at
+/// runtime via `intra_partition_topo` in runtime.rs, which has access to the
+/// full IRGraph edges. This function is kept for the `Partition` struct field
+/// and for callers that don't have graph access.
 fn compute_internal_order(blocks: &[IRBlock]) -> Vec<String> {
-    let block_ids: HashSet<String> = blocks.iter().map(|b| b.block_id.clone()).collect();
-    let mut in_degree: HashMap<String, usize> = HashMap::new();
-    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-
-    for block in blocks {
-        in_degree.entry(block.block_id.clone()).or_insert(0);
-    }
-
-    // Build adjacency list (only consider internal edges)
-    for block in blocks {
-        for src_block in &block.inputs {
-            if block_ids.contains(src_block) {
-                adj.entry(src_block.clone()).or_default().push(block.block_id.clone());
-                *in_degree.entry(block.block_id.clone()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // Topological sort using Kahn's algorithm
-    let mut queue: VecDeque<String> = in_degree.iter()
-        .filter(|(_, &deg)| deg == 0)
-        .map(|(id, _)| id.clone())
-        .collect();
-
-    let mut result = Vec::new();
-    while let Some(id) = queue.pop_front() {
-        result.push(id.clone());
-        if let Some(neighbors) = adj.get(&id) {
-            for neighbor in neighbors {
-                if let Some(deg) = in_degree.get_mut(neighbor) {
-                    if *deg > 0 {
-                        *deg -= 1;
-                        if *deg == 0 {
-                            queue.push_back(neighbor.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    result
+    // Return block IDs in their given order (already topologically consistent
+    // if blocks were added via partition_graph which iterates the fused graph).
+    blocks.iter().map(|b| b.block_id.clone()).collect()
 }
 
-/// Async execution lane for running partitions concurrently
+// ─────────────────────────────────────────────────────────────────────────────
+// AsyncLane
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Async execution lane for running partitions concurrently.
+///
+/// Each lane has a semaphore limiting concurrency. The caller provides a
+/// closure `F: Fn(Partition) -> Fut` that is fully responsible for block-level
+/// execution, inbox management, and inter-block value routing.
 pub struct AsyncLane {
-    #[allow(dead_code)]
-    id: String,
     semaphore: Arc<Semaphore>,
-    #[allow(dead_code)]
-    active_tasks: Arc<Mutex<JoinSet<BlockExecutionResult>>>,
 }
 
 impl AsyncLane {
-    pub fn new(id: String, max_concurrent: usize) -> Self {
+    pub fn new(_id: String, max_concurrent: usize) -> Self {
         Self {
-            id,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
-            active_tasks: Arc::new(Mutex::new(JoinSet::new())),
         }
     }
 
+    /// Execute a partition, returning results for all its blocks.
+    ///
+    /// The `executor` closure owns the execution logic: it reads inbox state,
+    /// runs each block, routes outputs to downstream inboxes, and returns one
+    /// `BlockExecutionResult` per block in the partition.
     pub async fn execute_partition<F, Fut>(
         &self,
-        partition: &Partition,
+        partition: Partition,
         executor: F,
-    ) -> BlockExecutionResult
+    ) -> Vec<BlockExecutionResult>
     where
-        F: Fn(IRBlock, String) -> Fut + Clone,
-        Fut: std::future::Future<Output = BlockExecutionResult> + Send,
+        F: Fn(Partition) -> Fut,
+        Fut: std::future::Future<Output = Vec<BlockExecutionResult>> + Send,
     {
         let _permit = self.semaphore.acquire().await.unwrap();
-
-        // Execute blocks sequentially within partition
-        let mut results = Vec::new();
-        for block_id in &partition.internal_order {
-            if let Some(block) = partition.blocks.iter().find(|b| b.block_id == *block_id) {
-                let result = executor(block.clone(), partition.node_id.clone()).await;
-                results.push(result);
-            }
-        }
-
-        // Return the last result as the partition result
-        results.into_iter().last().unwrap_or_else(|| BlockExecutionResult {
-            block_id: partition.partition_id.clone(),
-            partition_id: partition.partition_id.clone(),
-            node_id: partition.node_id.clone(),
-            start_time: 0,
-            end_time: 0,
-            value: crate::reducer::PayloadValue::I64(0),
-            merge_mode: MergeMode::List,
-            executor_name: "cpu".to_string(),
-        })
+        executor(partition).await
     }
 }
 
-/// Partition DAG scheduler
+// ─────────────────────────────────────────────────────────────────────────────
+// PartitionDAGScheduler
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// DAG-ordered partition scheduler.
+///
+/// Builds an inter-partition dependency graph from `Partition::external_inputs`,
+/// then executes partitions in topological order via `AsyncLane`s.
+///
+/// The caller provides the block-level execution logic as a closure:
+/// ```text
+/// F: Fn(Partition) -> impl Future<Output = Vec<BlockExecutionResult>>
+/// ```
+/// This closure is called once per partition and is responsible for executing
+/// every block within that partition (including inbox reads and output routing).
+/// `URXRuntime::execute_graph` uses this scheduler internally.
 pub struct PartitionDAGScheduler {
-    lanes: Vec<AsyncLane>,
+    pub lanes: Vec<AsyncLane>,
 }
 
 impl PartitionDAGScheduler {
@@ -172,29 +139,31 @@ impl PartitionDAGScheduler {
         Self { lanes }
     }
 
-    /// Schedule and execute partitions following DAG dependencies
-    pub async fn schedule_and_execute<P, F, Fut>(
+    /// Schedule and execute partitions following DAG dependencies.
+    ///
+    /// Partitions are ordered by `Partition::external_inputs` dependencies, then
+    /// dispatched to `AsyncLane`s in topological order. Returns a flat
+    /// `Vec<BlockExecutionResult>` for all blocks across all partitions.
+    pub async fn schedule_and_execute<F, Fut>(
         &self,
         partitions: Vec<Partition>,
         graph: &IRGraph,
         partition_map: &HashMap<String, String>,
         executor: F,
-    ) -> RuntimeResult
+    ) -> Vec<BlockExecutionResult>
     where
-        P: SchedulerPolicy,
-        F: Fn(IRBlock, String) -> Fut + Clone,
-        Fut: std::future::Future<Output = BlockExecutionResult> + Send,
+        F: Fn(Partition) -> Fut + Clone,
+        Fut: std::future::Future<Output = Vec<BlockExecutionResult>> + Send,
     {
-        // Build partition dependency graph
-        let (partition_dag, partition_index) = self.build_partition_dag(&partitions, graph, partition_map);
-
-        // Execute partitions using topological order
-        let results: RuntimeResult = self.execute_dag_partitions::<F, Fut>(partitions, partition_dag, partition_index, executor).await;
-
-        results
+        let (partition_dag, partition_index) =
+            self.build_partition_dag(&partitions, graph, partition_map);
+        self.execute_dag_partitions(partitions, partition_dag, partition_index, executor)
+            .await
     }
 
-    /// Build DAG of partition dependencies
+    // ── Private helpers ──────────────────────────────────────────────────────
+
+    /// Build a dependency map: partition_id → [partition_ids it depends on].
     fn build_partition_dag(
         &self,
         partitions: &[Partition],
@@ -209,60 +178,63 @@ impl PartitionDAGScheduler {
         let mut dag: HashMap<String, Vec<String>> = HashMap::new();
         for p in partitions {
             let deps = p.external_inputs(graph, partition_map);
-            let dep_partitions: HashSet<String> = deps.iter()
+            let dep_partitions: HashSet<String> = deps
+                .iter()
                 .filter_map(|bid| partition_map.get(bid))
                 .filter(|pid| *pid != &p.partition_id)
                 .cloned()
                 .collect();
-
             dag.insert(p.partition_id.clone(), dep_partitions.into_iter().collect());
         }
 
         (dag, partition_index)
     }
 
-    /// Execute partitions in DAG order with parallel execution
+    /// Execute partitions in DAG topological order, collecting all results.
     async fn execute_dag_partitions<F, Fut>(
         &self,
         partitions: Vec<Partition>,
         dag: HashMap<String, Vec<String>>,
         partition_index: HashMap<String, usize>,
         executor: F,
-    ) -> RuntimeResult
+    ) -> Vec<BlockExecutionResult>
     where
-        F: Fn(IRBlock, String) -> Fut + Clone,
-        Fut: std::future::Future<Output = BlockExecutionResult> + Send,
+        F: Fn(Partition) -> Fut + Clone,
+        Fut: std::future::Future<Output = Vec<BlockExecutionResult>> + Send,
     {
-        // Track completed partitions and their in-degrees
+        // Compute Kahn in-degrees.
         let mut in_degree: HashMap<String, usize> = HashMap::new();
-        let mut partition_map: HashMap<String, Partition> = HashMap::new();
+        let mut partition_store: HashMap<String, Partition> = HashMap::new();
 
         for p in &partitions {
             let deps = dag.get(&p.partition_id).map(|v| v.len()).unwrap_or(0);
             in_degree.insert(p.partition_id.clone(), deps);
-            partition_map.insert(p.partition_id.clone(), p.clone());
+        }
+        for p in partitions {
+            partition_store.insert(p.partition_id.clone(), p);
         }
 
-        // Find partitions with no dependencies
-        let mut ready: VecDeque<String> = in_degree.iter()
-            .filter(|(_, &deg)| deg == 0)
+        let mut ready: VecDeque<String> = in_degree
+            .iter()
+            .filter(|(_, &d)| d == 0)
             .map(|(id, _)| id.clone())
             .collect();
 
         let mut completed: HashSet<String> = HashSet::new();
         let mut all_results: Vec<BlockExecutionResult> = Vec::new();
 
-        // Process partitions in topological order
         while let Some(partition_id) = ready.pop_front() {
-            let partition = partition_map.remove(&partition_id).unwrap();
+            let partition = partition_store.remove(&partition_id).unwrap();
 
-            // Execute this partition
+            // Dispatch to the lane assigned to this partition index.
             let lane_idx = *partition_index.get(&partition_id).unwrap_or(&0) % self.lanes.len();
-            let result = self.lanes[lane_idx].execute_partition(&partition, executor.clone()).await;
-            all_results.push(result);
+            let block_results = self.lanes[lane_idx]
+                .execute_partition(partition, executor.clone())
+                .await;
+            all_results.extend(block_results);
             completed.insert(partition_id.clone());
 
-            // Update in-degrees of dependent partitions
+            // Decrement in-degrees of dependents.
             for (pid, deps) in &dag {
                 if deps.contains(&partition_id) {
                     if let Some(deg) = in_degree.get_mut(pid) {
@@ -275,29 +247,18 @@ impl PartitionDAGScheduler {
             }
         }
 
-        // Collect partition bindings
-        let partition_binding: HashMap<String, String> = partitions.iter()
-            .map(|p| (p.partition_id.clone(), p.node_id.clone()))
-            .collect();
-
-        RuntimeResult {
-            fused_graph_id: "dag-schedule".to_string(),
-            partitions: partition_binding.clone(),
-            partition_binding: partition_binding.clone(),
-            block_binding: HashMap::new(),
-            results: all_results,
-            outputs: Vec::new(),
-            packet_log: Vec::new(),
-            merged: HashMap::new(),
-            remote_sent_packets: 0,
-        }
+        all_results
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{IRBlock, IRGraph, MergeMode, Opcode};
+    use crate::ir::{IRBlock, Opcode};
 
     #[test]
     fn test_internal_order_computation() {
@@ -309,7 +270,6 @@ mod tests {
         let blocks = vec![block1.clone(), block2.clone(), block3];
         let order = compute_internal_order(&blocks);
 
-        // b1 and b2 should come before b3
         let pos1 = order.iter().position(|id| id == "b1");
         let pos2 = order.iter().position(|id| id == "b2");
         let pos3 = order.iter().position(|id| id == "b3");
@@ -339,7 +299,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_lane_creation() {
-        let lane = AsyncLane::new("test-lane".to_string(), 2);
-        assert_eq!(lane.id, "test-lane");
+        let _lane = AsyncLane::new("test-lane".to_string(), 2);
     }
 }

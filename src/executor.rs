@@ -129,6 +129,15 @@ pub fn eval_opcode(block: &IRBlock, ctx: &HashMap<String, PayloadValue>) -> Payl
         }
     };
 
+    // Helper: resolve a named input as f64
+    let f64_in = |name: &str| -> f64 {
+        match ctx.get(name).unwrap_or_else(|| panic!("missing input '{name}'")) {
+            PayloadValue::F64(v) => *v,
+            PayloadValue::I64(v) => *v as f64,
+            other => panic!("input '{name}' expected f64, got {other:?}"),
+        }
+    };
+
     match &block.opcode {
         // ── Constants ────────────────────────────────────────────────
         Opcode::UConstI64(v) => PayloadValue::I64(*v),
@@ -198,6 +207,7 @@ pub fn eval_opcode(block: &IRBlock, ctx: &HashMap<String, PayloadValue>) -> Payl
         Opcode::UConcat => {
             let to_s = |v: &PayloadValue| match v {
                 PayloadValue::I64(n) => n.to_string(),
+                PayloadValue::F64(n) => n.to_string(),
                 PayloadValue::Str(s) => s.clone(),
                 PayloadValue::List(_) => panic!("UConcat: List input not supported"),
             };
@@ -272,5 +282,36 @@ pub fn eval_opcode(block: &IRBlock, ctx: &HashMap<String, PayloadValue>) -> Payl
             assert!(cond != 0, "UAssert: condition is 0 (false)");
             PayloadValue::I64(cond)
         }
+
+        // ── F64: Constants ────────────────────────────────────────────
+        Opcode::FConst(v) => PayloadValue::F64(*v),
+
+        // ── F64: Binary Arithmetic ────────────────────────────────────
+        Opcode::FAdd => PayloadValue::F64(f64_in(&block.inputs[0]) + f64_in(&block.inputs[1])),
+        Opcode::FSub => PayloadValue::F64(f64_in(&block.inputs[0]) - f64_in(&block.inputs[1])),
+        Opcode::FMul => PayloadValue::F64(f64_in(&block.inputs[0]) * f64_in(&block.inputs[1])),
+        Opcode::FDiv => {
+            let b = f64_in(&block.inputs[1]);
+            assert!(b != 0.0, "FDiv: division by zero");
+            PayloadValue::F64(f64_in(&block.inputs[0]) / b)
+        }
+        Opcode::FPow => PayloadValue::F64(f64_in(&block.inputs[0]).powf(f64_in(&block.inputs[1]))),
+
+        // ── F64: Unary Arithmetic ─────────────────────────────────────
+        Opcode::FSqrt  => PayloadValue::F64(f64_in(&block.inputs[0]).sqrt()),
+        Opcode::FAbs   => PayloadValue::F64(f64_in(&block.inputs[0]).abs()),
+        Opcode::FNeg   => PayloadValue::F64(-f64_in(&block.inputs[0])),
+        Opcode::FFloor => PayloadValue::F64(f64_in(&block.inputs[0]).floor()),
+        Opcode::FCeil  => PayloadValue::F64(f64_in(&block.inputs[0]).ceil()),
+        Opcode::FRound => PayloadValue::F64(f64_in(&block.inputs[0]).round()),
+
+        // ── F64: Comparison ───────────────────────────────────────────
+        Opcode::FCmpEq => PayloadValue::I64((f64_in(&block.inputs[0]) == f64_in(&block.inputs[1])) as i64),
+        Opcode::FCmpLt => PayloadValue::I64((f64_in(&block.inputs[0]) <  f64_in(&block.inputs[1])) as i64),
+        Opcode::FCmpLe => PayloadValue::I64((f64_in(&block.inputs[0]) <= f64_in(&block.inputs[1])) as i64),
+
+        // ── F64: Type Conversion ──────────────────────────────────────
+        Opcode::F64ToI64 => PayloadValue::I64(f64_in(&block.inputs[0]) as i64),
+        Opcode::I64ToF64 => PayloadValue::F64(i64_in(&block.inputs[0]) as f64),
     }
 }

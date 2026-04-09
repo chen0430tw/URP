@@ -489,23 +489,30 @@ impl ETCoolingPolicy {
         nodes: &HashMap<String, Node>,
     ) -> HashMap<String, String> {
         // Collect unique partitions and eligible nodes per partition
-        let mut partition_ids: Vec<String> = {
+        let partition_ids: Vec<String> = {
             let mut set: std::collections::BTreeSet<String> = Default::default();
             for p in partitions.values() { set.insert(p.clone()); }
             set.into_iter().collect()
         };
 
-        // For each partition, find eligible nodes (matching required_tag)
+        // Stable node ordering — used by both `eligible` and the SA result lookup.
+        let node_ids: Vec<String> = {
+            let mut v: Vec<String> = nodes.keys().cloned().collect();
+            v.sort();  // deterministic order regardless of HashMap iteration
+            v
+        };
+        let n_nodes = node_ids.len();
+
+        // For each partition, find eligible node *indices* into node_ids
+        // (must match required_tag; if no tag constraint, all nodes eligible).
         let eligible: Vec<Vec<usize>> = partition_ids.iter().map(|pid| {
-            // Collect required tags from blocks in this partition
             let tags: HashSet<String> = graph.blocks.iter()
                 .filter(|b| partitions.get(&b.block_id).map(|p| p == pid).unwrap_or(false))
                 .flat_map(|b| std::iter::once(b.required_tag.clone()))
                 .filter(|t| !t.is_empty())
                 .collect();
 
-            let node_list: Vec<String> = nodes.keys().cloned().collect();
-            node_list.iter().enumerate()
+            node_ids.iter().enumerate()
                 .filter(|(_, nid)| {
                     let node = &nodes[*nid];
                     tags.is_empty() || tags.iter().all(|t| node.has_tag(t))
@@ -513,9 +520,6 @@ impl ETCoolingPolicy {
                 .map(|(i, _)| i)
                 .collect()
         }).collect();
-
-        let node_ids: Vec<String> = nodes.keys().cloned().collect();
-        let n_nodes = node_ids.len();
         if n_nodes == 0 || partition_ids.is_empty() {
             return HashMap::new();
         }
@@ -580,6 +584,17 @@ impl ETCoolingPolicy {
             route_cost_sum + imbalance_w * imbalance
         };
 
+        // Wrap the energy function: penalise any solution that violates eligible
+        // constraints with a large cost so SA never accepts such moves.
+        let energy_fn_constrained = |sol: &[usize]| -> f64 {
+            for (pi, &ni) in sol.iter().enumerate() {
+                if !eligible[pi].is_empty() && !eligible[pi].contains(&ni) {
+                    return f64::MAX / 2.0;
+                }
+            }
+            energy_fn(sol)
+        };
+
         // Run ET-WCN cooling
         let mut optimizer = ETWCNCooling::new(partition_ids.len())
             .with_temperature(self.t_max, self.t_min);
@@ -587,11 +602,21 @@ impl ETCoolingPolicy {
             optimizer = optimizer.with_seed(seed);
         }
 
-        let result = optimizer.optimize(initial, n_nodes, energy_fn, self.max_epochs);
+        let result = optimizer.optimize(initial, n_nodes, energy_fn_constrained, self.max_epochs);
+
+        // Project result back to eligible nodes (safety net in case SA drifted).
+        let final_sol: Vec<usize> = result.best_solution.iter().enumerate().map(|(pi, &ni)| {
+            if eligible[pi].is_empty() || eligible[pi].contains(&ni) {
+                ni
+            } else {
+                // Fallback: pick the highest-scoring eligible node.
+                eligible[pi][0]
+            }
+        }).collect();
 
         // Build output map
         partition_ids.iter().enumerate()
-            .map(|(i, pid)| (pid.clone(), node_ids[result.best_solution[i]].clone()))
+            .map(|(i, pid)| (pid.clone(), node_ids[final_sol[i]].clone()))
             .collect()
     }
 }

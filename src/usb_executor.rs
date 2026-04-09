@@ -73,7 +73,6 @@
 //!   `urp-register.exe --port COMx`.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use crate::executor::{eval_opcode, HardwareExecutor};
 use crate::ir::{IRBlock, Opcode};
@@ -344,6 +343,7 @@ pub fn encode_response(status: u8, result: Option<&PayloadValue>) -> Vec<u8> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct UsbLoopbackExecutor {
+    #[allow(dead_code)]
     device_id: String,
 }
 

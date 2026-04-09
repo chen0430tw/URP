@@ -68,6 +68,7 @@ impl URPPacket {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PayloadValue {
     I64(i64),
+    F64(f64),
     Str(String),
     List(Vec<PayloadValue>),
 }
@@ -77,12 +78,19 @@ pub struct PayloadCodec;
 impl PayloadCodec {
     const TYPE_I64: u8 = 1;
     const TYPE_STR: u8 = 2;
+    const TYPE_F64: u8 = 4;
 
     pub fn encode(value: &PayloadValue) -> Vec<u8> {
         match value {
             PayloadValue::I64(v) => {
                 let mut out = Vec::with_capacity(9);
                 out.push(Self::TYPE_I64);
+                out.extend_from_slice(&v.to_le_bytes());
+                out
+            }
+            PayloadValue::F64(v) => {
+                let mut out = Vec::with_capacity(9);
+                out.push(Self::TYPE_F64);
                 out.extend_from_slice(&v.to_le_bytes());
                 out
             }
@@ -114,6 +122,11 @@ impl PayloadCodec {
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(&bytes[1..9]);
                 PayloadValue::I64(i64::from_le_bytes(arr))
+            }
+            Self::TYPE_F64 => {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&bytes[1..9]);
+                PayloadValue::F64(f64::from_le_bytes(arr))
             }
             Self::TYPE_STR => {
                 let mut len = [0u8; 4];

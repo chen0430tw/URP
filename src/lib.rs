@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! URX Runtime v0.8
 //!
 //! A runtime for the Universal Reconstructive eXtensions (URX) architecture.
@@ -74,7 +75,7 @@ pub use kdmapper_ffi::{
 pub use cost::{node_score, route_cost};
 pub use executor::{BlockExecutor, CpuExecutor, eval_opcode, ExecutorRegistry, HardwareExecutor, ThreadPoolExecutor};
 #[cfg(feature = "gpu")]
-pub use gpu_executor::WgpuExecutor;
+pub use gpu_executor::{WgpuExecutor, JitBlockExecutor};
 pub use ir::{IRBlock, IREdge, IRGraph, MergeMode, Opcode};
 pub use node::{Node, NodeType};
 pub use optimizer::{fuse_linear_blocks, partition_graph};

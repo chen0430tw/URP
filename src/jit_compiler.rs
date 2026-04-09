@@ -33,7 +33,6 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::ir::{IRGraph, Opcode};
-use crate::packet::PayloadValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Value type in the shader
@@ -190,7 +189,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if input_indices.contains(&reg) { continue; }
 
         let ins = incoming.get(id).cloned().unwrap_or_default();
-        let get = |key: &str| ins.get(key).copied()
+        let _get = |key: &str| ins.get(key).copied()
             .unwrap_or_else(|| panic!("JIT: block '{id}' missing input '{key}'"));
 
         let line = emit_op(&block.opcode, reg, &topo, &reg_idx, &ins, &result_types)?;
@@ -236,10 +235,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 fn emit_op(
     opcode: &Opcode,
     dst: usize,
-    topo: &[String],
-    reg_idx: &HashMap<String, usize>,
+    _topo: &[String],
+    _reg_idx: &HashMap<String, usize>,
     ins: &HashMap<String, usize>,
-    types: &HashMap<String, ShaderType>,
+    _types: &HashMap<String, ShaderType>,
 ) -> Result<String, String> {
     let a = || ins.get("a").copied().unwrap_or(0);
     let b = || ins.get("b").copied().unwrap_or(0);
@@ -317,7 +316,7 @@ fn emit_op(
 // Type inference
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn infer_type(opcode: &Opcode, known: &HashMap<String, ShaderType>) -> ShaderType {
+fn infer_type(opcode: &Opcode, _known: &HashMap<String, ShaderType>) -> ShaderType {
     match opcode {
         Opcode::UConstI64(_) | Opcode::UAdd | Opcode::USub | Opcode::UMul |
         Opcode::UDiv | Opcode::URem | Opcode::UAnd | Opcode::UOr | Opcode::UXor |

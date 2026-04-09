@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MergeMode {
     List = 1,
     Sum = 2,
@@ -6,7 +8,7 @@ pub enum MergeMode {
     ReduceMax = 4,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Opcode {
     // ── Constants ────────────────────────────────────────────────
     UConstI64(i64),
@@ -45,9 +47,36 @@ pub enum Opcode {
     UMax,      // i64, i64 → i64
     UAbs,      // i64      → i64
     UAssert,   // i64(cond)  → i64   (pass-through; panics when cond == 0)
+
+    // ── F64: Constants ────────────────────────────────────────────
+    FConst(f64),   // → f64
+
+    // ── F64: Binary Arithmetic ────────────────────────────────────
+    FAdd,   // f64 + f64
+    FSub,   // f64 - f64
+    FMul,   // f64 * f64
+    FDiv,   // f64 / f64
+    FPow,   // f64 ^ f64
+
+    // ── F64: Unary Arithmetic ─────────────────────────────────────
+    FSqrt,   // sqrt(f64)
+    FAbs,    // |f64|
+    FNeg,    // -f64
+    FFloor,  // floor(f64)
+    FCeil,   // ceil(f64)
+    FRound,  // round(f64)
+
+    // ── F64: Comparison (returns 1 or 0 as i64) ──────────────────
+    FCmpEq,  // f64 == f64 → i64
+    FCmpLt,  // f64 <  f64 → i64
+    FCmpLe,  // f64 <= f64 → i64
+
+    // ── F64: Type Conversion ──────────────────────────────────────
+    F64ToI64,  // f64 → i64  (truncate)
+    I64ToF64,  // i64 → f64
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IRBlock {
     pub block_id: String,
     pub opcode: Opcode,
@@ -86,7 +115,7 @@ impl IRBlock {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IREdge {
     pub src_block: String,
     pub dst_block: String,
@@ -94,7 +123,7 @@ pub struct IREdge {
     pub input_key: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IRGraph {
     pub graph_id: String,
     pub blocks: Vec<IRBlock>,
@@ -120,5 +149,28 @@ impl IRGraph {
 
     pub fn get_block(&self, id: &str) -> Option<&IRBlock> {
         self.blocks.iter().find(|b| b.block_id == id)
+    }
+
+    /// Deserialize an `IRGraph` from a JSON string.
+    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(s)
+    }
+
+    /// Serialize this `IRGraph` to a pretty-printed JSON string.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Load an `IRGraph` from a JSON file.
+    pub fn load_json(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let s = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&s)?)
+    }
+
+    /// Save this `IRGraph` to a JSON file.
+    pub fn save_json(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let s = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, s)?;
+        Ok(())
     }
 }

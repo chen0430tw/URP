@@ -332,3 +332,108 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
 
 #[cfg(feature = "gpu")]
 pub use gpu::WgpuExecutor;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JitBlockExecutor — HardwareExecutor backed by JIT WGSL compilation
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "gpu")]
+pub mod jit_block {
+    use std::collections::HashMap;
+
+    use crate::executor::{eval_opcode, HardwareExecutor};
+    use crate::ir::{IRBlock, IREdge, IRGraph, Opcode};
+    use crate::jit_compiler::JitExecutor;
+    use crate::packet::PayloadValue;
+
+    /// JIT-based HardwareExecutor: compiles each block into a WGSL shader
+    /// and dispatches it via `JitExecutor`.
+    ///
+    /// String ops and zero-input const blocks fall back to CPU.
+    pub struct JitBlockExecutor {
+        pub jit: JitExecutor,
+    }
+
+    impl JitBlockExecutor {
+        pub async fn new() -> Result<Self, String> {
+            let jit = JitExecutor::new().await?;
+            Ok(Self { jit })
+        }
+
+        pub fn adapter_info(&self) -> &str {
+            &self.jit.adapter_info
+        }
+    }
+
+    impl HardwareExecutor for JitBlockExecutor {
+        fn name(&self) -> &'static str { "jit-gpu" }
+
+        fn exec(&self, block: &IRBlock, ctx: &HashMap<String, PayloadValue>) -> PayloadValue {
+            // String ops: not representable in WGSL — fall back to CPU
+            match &block.opcode {
+                Opcode::UConstStr(_) | Opcode::UI64ToStr | Opcode::UStrToI64
+                | Opcode::UStrLen   | Opcode::UStrSlice  | Opcode::UStrSplit
+                | Opcode::UConcat => return eval_opcode(block, ctx),
+                _ => {}
+            }
+
+            // Const blocks (0 inputs): trivial, no GPU round-trip needed
+            if block.inputs.is_empty() {
+                return eval_opcode(block, ctx);
+            }
+
+            // Build a mini IRGraph: one const-source block per input → op block
+            let mut g = IRGraph::with_id("jit_single".into());
+            let mut input_vals: Vec<Vec<f32>> = Vec::new();
+
+            for (i, name) in block.inputs.iter().enumerate() {
+                let val = ctx.get(name).unwrap_or(&PayloadValue::I64(0));
+                let (fval, src_opcode) = match val {
+                    PayloadValue::F64(v) => (*v as f32, Opcode::FConst(0.0)),
+                    PayloadValue::I64(v) => (*v as f32, Opcode::UConstI64(0)),
+                    _ => (0.0f32, Opcode::UConstI64(0)),
+                };
+                let src_id = format!("__s{i}");
+                g.blocks.push(IRBlock::new(&src_id, src_opcode));
+                g.edges.push(IREdge {
+                    src_block: src_id.clone(),
+                    dst_block: "__op".into(),
+                    output_key: src_id,
+                    input_key: name.clone(),
+                });
+                input_vals.push(vec![fval]);
+            }
+
+            let mut op = IRBlock::new("__op", block.opcode.clone());
+            op.inputs = block.inputs.clone();
+            g.blocks.push(op);
+
+            let compiled = match self.jit.compile(&g) {
+                Ok(c) => c,
+                Err(_) => return eval_opcode(block, ctx),
+            };
+
+            let outputs = match self.jit.run(&compiled, &input_vals, 1) {
+                Ok(o) => o,
+                Err(_) => return eval_opcode(block, ctx),
+            };
+
+            if outputs.is_empty() || outputs[0].is_empty() {
+                return eval_opcode(block, ctx);
+            }
+
+            let v = outputs[0][0];
+            // Return type based on opcode
+            match &block.opcode {
+                Opcode::FAdd | Opcode::FSub | Opcode::FMul | Opcode::FDiv | Opcode::FPow
+                | Opcode::FSqrt | Opcode::FAbs | Opcode::FNeg | Opcode::FFloor
+                | Opcode::FCeil | Opcode::FRound | Opcode::I64ToF64 =>
+                    PayloadValue::F64(v as f64),
+                _ => PayloadValue::I64(v as i64),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+pub use jit_block::JitBlockExecutor;

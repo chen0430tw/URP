@@ -1,19 +1,26 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::cost::route_cost;
 use crate::et_cooling::ETCoolingPolicy;
-use crate::executor::{eval_opcode, ExecutorRegistry};
-use crate::ir::{IRGraph, MergeMode};
-use crate::node::Node;
+use crate::executor::{ExecutorRegistry, ThreadPoolExecutor};
+use crate::ir::{IRBlock, IRGraph, MergeMode};
+use crate::node::{Node, NodeType};
 use crate::optimizer::{fuse_linear_blocks, partition_graph};
 use crate::packet::{PayloadCodec, PayloadValue, URPPacket};
 use crate::partition::bind_partitions;
 use crate::policy::SchedulerPolicy;
 use crate::reducer::run_reducers;
 use crate::remote::RemotePacketLink;
-use crate::reservation::ReservationTable;
+use crate::reservation::{Reservation, ReservationTable};
 use crate::ring::LocalRingTunnel;
+use crate::scheduler::{Partition, PartitionDAGScheduler};
+use tokio::sync::Mutex;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Result types
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct PacketLog {
@@ -31,7 +38,9 @@ pub struct BlockExecutionResult {
     pub block_id: String,
     pub partition_id: String,
     pub node_id: String,
+    /// Wall-clock milliseconds from graph execution start.
     pub start_time: u32,
+    /// Wall-clock milliseconds from graph execution start.
     pub end_time: u32,
     pub value: PayloadValue,
     pub merge_mode: MergeMode,
@@ -41,26 +50,31 @@ pub struct BlockExecutionResult {
 #[derive(Debug, Clone)]
 pub struct RuntimeResult {
     pub fused_graph_id: String,
+    /// block_id → partition_id
     pub partitions: HashMap<String, String>,
+    /// partition_id → node_id
     pub partition_binding: HashMap<String, String>,
+    /// block_id → node_id
     pub block_binding: HashMap<String, String>,
     pub results: Vec<BlockExecutionResult>,
     pub packet_log: Vec<PacketLog>,
     pub merged: HashMap<String, String>,
     pub remote_sent_packets: usize,
+    /// Values produced by leaf blocks (no outgoing edges).
     pub outputs: Vec<PayloadValue>,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// URXRuntime
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub struct URXRuntime<P: SchedulerPolicy> {
     pub nodes: HashMap<String, Node>,
-    rings: HashMap<(String, String), LocalRingTunnel>,
     remote: RemotePacketLink,
     reservations: ReservationTable,
     policy: P,
     pub executors: ExecutorRegistry,
-    /// Optional ET-WCN global scheduling optimizer.
-    /// When set, replaces the default `bind_partitions` with a simulated-annealing
-    /// search over partition→node assignments.
+    /// ET-WCN optimizer: when set, replaces `bind_partitions` with SA search.
     et_policy: Option<ETCoolingPolicy>,
 }
 
@@ -69,7 +83,6 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
         let nodes = nodes.into_iter().map(|n| (n.node_id.clone(), n)).collect();
         Self {
             nodes,
-            rings: HashMap::new(),
             remote: RemotePacketLink::new(),
             reservations: ReservationTable::default(),
             policy,
@@ -78,193 +91,313 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
         }
     }
 
-    /// Enable ET-WCN cooling as the global partition-to-node optimizer.
     pub fn set_et_policy(&mut self, p: ETCoolingPolicy) {
         self.et_policy = Some(p);
     }
 
-    fn ensure_ring(&mut self, src: &str, dst: &str) {
-        let key = (src.to_string(), dst.to_string());
-        self.rings.entry(key).or_insert_with(|| LocalRingTunnel::new(128));
+    /// Pre-load a reservation into the table (e.g. for Demo C backfill testing).
+    pub fn add_reservation(&mut self, r: Reservation) {
+        self.reservations.add(r);
     }
 
-    fn route_kind(&self, src: &str, dst: &str) -> &'static str {
-        let a = self.nodes.get(src).unwrap();
-        let b = self.nodes.get(dst).unwrap();
-        if a.host_id == b.host_id { "local-ring" } else { "remote-packet" }
-    }
+    /// Workstation mode: auto-register executors based on node type.
+    ///
+    /// - `NodeType::Cpu`  → `ThreadPoolExecutor` with all logical cores
+    /// - `NodeType::Gpu`  → `WgpuExecutor` (GPU feature) or ThreadPool fallback
+    ///
+    /// Call before `execute_graph`. Nodes without a type match keep the
+    /// default `CpuExecutor`.
+    pub fn enable_workstation_mode(&mut self) {
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let tpool: Arc<dyn crate::executor::HardwareExecutor> =
+            Arc::new(ThreadPoolExecutor::new(parallelism));
 
-    /// Compute topological waves: each wave is a set of blocks with no
-    /// dependencies on each other (all predecessors are in earlier waves).
-    /// Blocks within the same wave can safely execute in parallel.
-    fn topo_waves(&self, graph: &IRGraph) -> Vec<Vec<String>> {
-        let mut indeg: HashMap<String, usize> = HashMap::new();
-        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-
-        for b in &graph.blocks {
-            indeg.insert(b.block_id.clone(), 0);
+        let cpu_node_ids: Vec<String> = self.nodes.values()
+            .filter(|n| n.node_type == NodeType::Cpu)
+            .map(|n| n.node_id.clone())
+            .collect();
+        for nid in cpu_node_ids {
+            self.executors.register(nid, Arc::clone(&tpool));
         }
-        for e in &graph.edges {
-            *indeg.get_mut(&e.dst_block).unwrap() += 1;
-            adj.entry(e.src_block.clone()).or_default().push(e.dst_block.clone());
-        }
 
-        let mut waves = Vec::new();
-        loop {
-            let ready: Vec<String> = indeg.iter()
-                .filter(|(_, d)| **d == 0)
-                .map(|(k, _)| k.clone())
+        #[cfg(feature = "gpu")]
+        {
+            let gpu_node_ids: Vec<String> = self.nodes.values()
+                .filter(|n| n.node_type == NodeType::Gpu)
+                .map(|n| n.node_id.clone())
                 .collect();
-            if ready.is_empty() { break; }
-            for id in &ready {
-                indeg.remove(id);
-                if let Some(nexts) = adj.get(id) {
-                    for nxt in nexts {
-                        *indeg.get_mut(nxt).unwrap() -= 1;
+            if !gpu_node_ids.is_empty() {
+                // WgpuExecutor::new() is async; use pollster to block here.
+                let gpu_exec = pollster::block_on(crate::gpu_executor::WgpuExecutor::new());
+                match gpu_exec {
+                    Ok(exec) => {
+                        let shared: Arc<dyn crate::executor::HardwareExecutor> = Arc::new(exec);
+                        for nid in gpu_node_ids {
+                            self.executors.register(nid, Arc::clone(&shared));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[workstation] GPU init failed, falling back to thread-pool: {e}");
+                        for nid in gpu_node_ids {
+                            self.executors.register(nid, Arc::clone(&tpool));
+                        }
                     }
                 }
             }
-            waves.push(ready);
         }
-        waves
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // execute_graph
+    // ─────────────────────────────────────────────────────────────────────
+
     pub async fn execute_graph(&mut self, graph: &IRGraph) -> RuntimeResult {
+        let graph_start = Instant::now();
+
+        // ── 1. Fuse + partition ──────────────────────────────────────────
         let fused = fuse_linear_blocks(graph);
-        let partitions = partition_graph(&fused);
+        let partition_map = partition_graph(&fused);
+
         let partition_binding = if let Some(ref et) = self.et_policy {
-            et.optimise_binding(&fused, &partitions, &self.nodes)
+            et.optimise_binding(&fused, &partition_map, &self.nodes)
         } else {
-            bind_partitions(&fused, &partitions, &self.nodes, &self.policy)
+            bind_partitions(&fused, &partition_map, &self.nodes, &self.policy)
         };
 
-        for (pid, nid) in &partition_binding {
-            self.reservations.add(crate::reservation::Reservation::new(
-                pid.clone(),
-                nid.clone(),
-                0,
-                10,
-            ));
+        // ── 2. Build Partition objects (from scheduler.rs) ───────────────
+        // Group blocks by partition ID.
+        let mut blocks_by_partition: HashMap<String, Vec<IRBlock>> = HashMap::new();
+        for b in &fused.blocks {
+            let pid = partition_map.get(&b.block_id).cloned().unwrap_or_default();
+            blocks_by_partition.entry(pid).or_default().push(b.clone());
         }
 
-        let mut block_binding = HashMap::new();
+        let partitions: HashMap<String, Partition> = partition_binding
+            .iter()
+            .map(|(pid, nid)| {
+                let blocks = blocks_by_partition.remove(pid).unwrap_or_default();
+                (pid.clone(), Partition::new(pid.clone(), blocks, nid.clone()))
+            })
+            .collect();
+
+        // ── 3. Block → node binding ──────────────────────────────────────
+        let mut block_binding: HashMap<String, String> = HashMap::new();
         for b in &fused.blocks {
-            let pid = partitions.get(&b.block_id).unwrap();
+            let pid = partition_map.get(&b.block_id).unwrap();
             let nid = partition_binding.get(pid).unwrap().clone();
             block_binding.insert(b.block_id.clone(), nid);
         }
 
-        let waves = self.topo_waves(&fused);
-        let mut inbox: HashMap<String, HashMap<String, PayloadValue>> = HashMap::new();
-        let mut results = Vec::new();
-        let mut packet_log = Vec::new();
+        // ── 4. Reservation: find backfill windows, then record slots ─────
+        // We compute estimated slot positions based on backfill availability,
+        // then add the reservations so downstream code can query them.
+        let mut partition_slots: HashMap<String, (u32, u32)> = HashMap::new();
+        let now_slot = 0u32;
 
-        for b in &fused.blocks {
-            inbox.insert(b.block_id.clone(), HashMap::new());
+        for (pid, nid) in &partition_binding {
+            let partition = &partitions[pid];
+            let est: u32 = partition.blocks.iter().map(|b| b.estimated_duration).sum();
+            let est = est.max(1);
+
+            // Find the earliest backfill-compatible slot on this node.
+            let slot_start = self.reservations
+                .earliest_start_time(nid, est, now_slot)
+                .unwrap_or(now_slot);
+            let slot_end = slot_start + est;
+
+            partition_slots.insert(pid.clone(), (slot_start, slot_end));
+            self.reservations.add(Reservation::new(
+                pid.clone(),
+                nid.clone(),
+                slot_start,
+                slot_end,
+            ));
         }
 
-        for wave in waves {
-            // ── Determine if any block in this wave uses a parallel executor ──
-            let any_parallel = wave.iter().any(|bid| {
-                let node_id = block_binding.get(bid).unwrap();
-                self.executors.is_parallel(node_id)
-            });
+        // ── 5. Shared execution state (Arc<Mutex<>>) ────────────────────
+        //
+        // `PartitionDAGScheduler` accepts a `Fn(Partition) -> Fut` closure that
+        // is fully responsible for block execution and inter-block routing.
+        // Mutable state is shared via Arc<Mutex<>> so the closure can capture it.
 
-            // ── Execute all blocks in this wave ──────────────────────────────
-            // Parallel path: spawn one blocking task per block, join all.
-            // Sequential path: run blocks one after another (CpuExecutor default).
-            let wave_values: Vec<(String, PayloadValue, String)> = if any_parallel {
-                // Clone data needed for spawn_blocking (requires 'static)
-                let tasks: Vec<_> = wave.iter().map(|block_id| {
-                    let block = fused.blocks.iter().find(|b| b.block_id == *block_id).unwrap().clone();
-                    let ctx = inbox.get(block_id).unwrap().clone();
-                    let node_id = block_binding.get(block_id).unwrap().clone();
-                    let executor = self.executors.get(&node_id);
-                    let bid = block_id.clone();
-                    let exec_name = executor.name().to_string();
-                    tokio::task::spawn_blocking(move || {
-                        let value = executor.exec(&block, &ctx);
-                        (bid, value, exec_name)
-                    })
-                }).collect();
+        let mut init_inbox: HashMap<String, HashMap<String, PayloadValue>> = HashMap::new();
+        for b in &fused.blocks {
+            init_inbox.insert(b.block_id.clone(), HashMap::new());
+        }
 
-                let mut values = Vec::new();
-                for task in tasks {
-                    values.push(task.await.expect("executor task panicked"));
-                }
-                values
-            } else {
-                wave.iter().map(|block_id| {
-                    let block = fused.blocks.iter().find(|b| b.block_id == *block_id).unwrap();
-                    let ctx = inbox.get(block_id).unwrap();
-                    let node_id = block_binding.get(block_id).unwrap();
-                    let executor = self.executors.get(node_id);
-                    let value = executor.exec(block, ctx);
-                    (block_id.clone(), value, executor.name().to_string())
-                }).collect()
-            };
+        let shared_inbox  = Arc::new(Mutex::new(init_inbox));
+        let shared_log    = Arc::new(Mutex::new(Vec::<PacketLog>::new()));
+        let shared_rings  = Arc::new(Mutex::new(HashMap::<(String, String), LocalRingTunnel>::new()));
+        let shared_remote = Arc::new(Mutex::new(RemotePacketLink::new()));
+        // Collect inertia-key updates: (node_id, key) pairs to apply after execution.
+        let shared_inertia: Arc<Mutex<Vec<(String, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
 
-            // ── Post-wave: update inertia, record results, route packets ─────
-            for (block_id, value, exec_name) in wave_values {
-                let block = fused.blocks.iter().find(|b| b.block_id == block_id).unwrap();
-                let node_id = block_binding.get(&block_id).unwrap().clone();
+        // Snapshot non-mutable runtime state for closure capture.
+        let exec_reg    = self.executors.clone();
+        let nodes_snap  = self.nodes.clone();
+        let fused_arc   = Arc::new(fused);
+        let bb_arc      = Arc::new(block_binding.clone());
+        let pm_arc      = Arc::new(partition_map.clone());
 
-                if let Some(key) = &block.inertia_key {
-                    if let Some(node) = self.nodes.get_mut(&node_id) {
-                        node.remember_inertia_key(key);
+        // ── 6. Build executor closure and run scheduler ──────────────────
+
+        let partitions_vec: Vec<Partition> = partitions.into_values().collect();
+
+        let (inbox_c, log_c, rings_c, remote_c, inertia_c) = (
+            Arc::clone(&shared_inbox),
+            Arc::clone(&shared_log),
+            Arc::clone(&shared_rings),
+            Arc::clone(&shared_remote),
+            Arc::clone(&shared_inertia),
+        );
+        let (fused_ec, bb_ec, pm_ec) = (
+            Arc::clone(&fused_arc),
+            Arc::clone(&bb_arc),
+            Arc::clone(&pm_arc),
+        );
+
+        let exec_closure = move |partition: Partition| {
+            // Clone Arc refs into the async block (each invocation gets its own copy).
+            let inbox_c   = Arc::clone(&inbox_c);
+            let log_c     = Arc::clone(&log_c);
+            let rings_c   = Arc::clone(&rings_c);
+            let remote_c  = Arc::clone(&remote_c);
+            let inertia_c = Arc::clone(&inertia_c);
+            let exec_reg  = exec_reg.clone();
+            let nodes_s   = nodes_snap.clone();
+            let fused     = Arc::clone(&fused_ec);
+            let bb        = Arc::clone(&bb_ec);
+            let pm        = Arc::clone(&pm_ec);
+            let gs        = graph_start;
+
+            async move {
+                let block_order = intra_partition_topo(&partition.blocks, &fused);
+                let mut part_results = Vec::new();
+
+                for block_id in &block_order {
+                    let block = fused.blocks.iter()
+                        .find(|b| &b.block_id == block_id)
+                        .unwrap()
+                        .clone();
+                    let ctx = inbox_c.lock().await
+                        .get(block_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let node_id  = partition.node_id.clone();
+                    let executor = exec_reg.get(&node_id);
+
+                    let block_start_ms = gs.elapsed().as_micros() as u32;
+
+                    let value = if exec_reg.is_parallel(&node_id) {
+                        let exec_c  = Arc::clone(&executor);
+                        let block_c = block.clone();
+                        let ctx_c   = ctx.clone();
+                        tokio::task::spawn_blocking(move || exec_c.exec(&block_c, &ctx_c))
+                            .await
+                            .expect("executor task panicked")
+                    } else {
+                        executor.exec(&block, &ctx)
+                    };
+
+                    let block_end_ms   = gs.elapsed().as_micros() as u32;
+                    let executor_name  = executor.name().to_string();
+
+                    // Collect inertia-key update (applied after scheduler returns).
+                    if let Some(key) = &block.inertia_key {
+                        inertia_c.lock().await.push((node_id.clone(), key.clone()));
+                    }
+
+                    part_results.push(BlockExecutionResult {
+                        block_id:      block_id.clone(),
+                        partition_id:  partition.partition_id.clone(),
+                        node_id:       node_id.clone(),
+                        start_time:    block_start_ms,
+                        end_time:      block_end_ms,
+                        value:         value.clone(),
+                        merge_mode:    block.merge_mode,
+                        executor_name,
+                    });
+
+                    // Route value to each downstream block.
+                    for e in fused.edges.iter().filter(|e| &e.src_block == block_id) {
+                        let dst_node = bb.get(&e.dst_block).unwrap().clone();
+                        let payload  = PayloadCodec::encode(&value);
+                        let packet   = URPPacket::build(
+                            6, block.merge_mode, &e.src_block, &e.dst_block, &payload,
+                        );
+
+                        let src_n = nodes_s.get(&node_id).unwrap();
+                        let dst_n = nodes_s.get(&dst_node).unwrap();
+                        let is_local = src_n.host_id == dst_n.host_id;
+                        let cost     = route_cost(src_n, dst_n);
+
+                        let recv_value = if is_local {
+                            let key = (node_id.clone(), dst_node.clone());
+                            let mut guard = rings_c.lock().await;
+                            let ring = guard.entry(key)
+                                .or_insert_with(|| LocalRingTunnel::new(128));
+                            ring.push(packet).await;
+                            let recv = ring.pop().await;
+                            PayloadCodec::decode(recv.payload())
+                        } else {
+                            let recv = remote_c.lock().await.send_legacy(packet).await;
+                            PayloadCodec::decode(recv.payload())
+                        };
+
+                        inbox_c.lock().await
+                            .entry(e.dst_block.clone())
+                            .or_default()
+                            .insert(e.input_key.clone(), recv_value);
+
+                        log_c.lock().await.push(PacketLog {
+                            src_block:    e.src_block.clone(),
+                            dst_block:    e.dst_block.clone(),
+                            src_node:     node_id.clone(),
+                            dst_node:     dst_node.clone(),
+                            route_type:   if is_local { "local-ring" } else { "remote-packet" }
+                                          .to_string(),
+                            partition_id: pm.get(&e.dst_block).unwrap().clone(),
+                            route_cost:   cost,
+                        });
                     }
                 }
 
-                results.push(BlockExecutionResult {
-                    block_id: block.block_id.clone(),
-                    partition_id: partitions.get(&block.block_id).unwrap().clone(),
-                    node_id: node_id.clone(),
-                    start_time: 0,
-                    end_time: 0,
-                    value: value.clone(),
-                    merge_mode: block.merge_mode,
-                    executor_name: exec_name,
-                });
+                part_results
+            }
+        };
 
-                for e in fused.edges.iter().filter(|e| e.src_block == block.block_id) {
-                    let dst_node = block_binding.get(&e.dst_block).unwrap().clone();
-                    let payload = PayloadCodec::encode(&value);
-                    let packet = URPPacket::build(6, block.merge_mode, &e.src_block, &e.dst_block, &payload);
-                    let route = self.route_kind(&node_id, &dst_node).to_string();
+        let scheduler = PartitionDAGScheduler::new(1, 1);
+        let results = scheduler
+            .schedule_and_execute(partitions_vec, &fused_arc, &partition_map, exec_closure)
+            .await;
 
-                    let cost = {
-                        let a = self.nodes.get(&node_id).unwrap();
-                        let b = self.nodes.get(&dst_node).unwrap();
-                        route_cost(a, b)
-                    };
-
-                    let recv_value = if route == "local-ring" {
-                        self.ensure_ring(&node_id, &dst_node);
-                        let key = (node_id.clone(), dst_node.clone());
-                        let ring = self.rings.get_mut(&key).unwrap();
-                        ring.push(packet).await;
-                        let recv = ring.pop().await;
-                        PayloadCodec::decode(recv.payload())
-                    } else {
-                        let recv = self.remote.send_legacy(packet).await;
-                        PayloadCodec::decode(recv.payload())
-                    };
-
-                    inbox.entry(e.dst_block.clone()).or_default()
-                        .insert(e.input_key.clone(), recv_value);
-
-                    packet_log.push(PacketLog {
-                        src_block: e.src_block.clone(),
-                        dst_block: e.dst_block.clone(),
-                        src_node: node_id.clone(),
-                        dst_node: dst_node.clone(),
-                        route_type: route,
-                        partition_id: partitions.get(&e.dst_block).unwrap().clone(),
-                        route_cost: cost,
-                    });
-                }
+        // ── 7. Apply inertia updates and accumulate remote counter ───────
+        for (node_id, key) in shared_inertia.lock().await.drain(..) {
+            if let Some(node) = self.nodes.get_mut(&node_id) {
+                node.remember_inertia_key(&key);
             }
         }
+        self.remote.sent_packets += shared_remote.lock().await.sent_packets;
+
+        // ── 8. Collect leaf outputs and merge ────────────────────────────
+        let packet_log = Arc::try_unwrap(shared_log)
+            .unwrap()
+            .into_inner();
+
+        let has_outgoing: HashSet<&str> = fused_arc
+            .edges
+            .iter()
+            .map(|e| e.src_block.as_str())
+            .collect();
+
+        let outputs: Vec<PayloadValue> = results
+            .iter()
+            .filter(|r| !has_outgoing.contains(r.block_id.as_str()))
+            .map(|r| r.value.clone())
+            .collect();
 
         let mut grouped: HashMap<MergeMode, Vec<PayloadValue>> = HashMap::new();
         for r in &results {
@@ -272,15 +405,55 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
         }
 
         RuntimeResult {
-            fused_graph_id: fused.graph_id.clone(),
-            partitions,
+            fused_graph_id:       fused_arc.graph_id.clone(),
+            partitions:           partition_map,
             partition_binding,
             block_binding,
             results,
             packet_log,
-            merged: run_reducers(&grouped),
-            remote_sent_packets: self.remote.sent_packets,
-            outputs: Vec::new(),
+            merged:               run_reducers(&grouped),
+            remote_sent_packets:  self.remote.sent_packets,
+            outputs,
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Topological sort of blocks within a single partition, using only the graph
+/// edges whose both endpoints belong to this partition.
+fn intra_partition_topo(blocks: &[IRBlock], graph: &IRGraph) -> Vec<String> {
+    let ids: HashSet<&str> = blocks.iter().map(|b| b.block_id.as_str()).collect();
+    let mut in_deg: HashMap<String, usize> =
+        blocks.iter().map(|b| (b.block_id.clone(), 0)).collect();
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+
+    for e in &graph.edges {
+        if ids.contains(e.src_block.as_str()) && ids.contains(e.dst_block.as_str()) {
+            adj.entry(e.src_block.clone()).or_default().push(e.dst_block.clone());
+            *in_deg.get_mut(&e.dst_block).unwrap() += 1;
+        }
+    }
+
+    let mut queue: VecDeque<String> = in_deg
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut order = Vec::new();
+
+    while let Some(bid) = queue.pop_front() {
+        order.push(bid.clone());
+        for next in adj.get(&bid).cloned().unwrap_or_default() {
+            let d = in_deg.get_mut(&next).unwrap();
+            *d -= 1;
+            if *d == 0 {
+                queue.push_back(next);
+            }
+        }
+    }
+
+    order
 }

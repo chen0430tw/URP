@@ -1,6 +1,39 @@
 # URX Changelog
 
-## v1.0（当前）
+## v1.1（当前）
+
+### PartitionDAGScheduler 完整集成
+- `PartitionDAGScheduler` 从死代码升级为 `URXRuntime::execute_graph()` 的核心调度层
+- `AsyncLane` 接口重构：从 block 级闭包 `Fn(IRBlock, String)` → partition 级 `Fn(Partition) -> Vec<BlockExecutionResult>`
+- `execute_graph()` 将所有可变执行状态（inbox / packet_log / rings / remote / inertia）包装为 `Arc<Mutex<>>` 供 async 闭包捕获
+- 删除冗余的 `topo_sort_partitions` 自由函数（调度器内部处理）
+- 删除 `AsyncLane.id` 字段（未使用），`new()` 改为 `_id: String`
+
+### IRGraph JSON 序列化
+- 为 `MergeMode`、`Opcode`、`IRBlock`、`IREdge`、`IRGraph` 添加 `serde::{Serialize, Deserialize}` 派生
+- `IRGraph::from_json(s)` / `to_json()` — 字符串级往返
+- `IRGraph::load_json(path)` / `save_json(path)` — 文件级 I/O
+- `tests/json_schema_test.rs`：`test_json_round_trip`、`test_json_schema_opcodes` 两个测试
+
+### 新演示（Demo H–L）
+- **Demo H** — ZeroCopyContext：SharedMemoryRegion 写/读/reader_count；BufferPool acquire/release/stats；InertiaBufferCache put/get/LRU 淘汰（容量=3）；ZeroCopyContext 统一门面
+- **Demo I** — JIT 编译（CPU 路径）：4 块 FConst→FMul→FAdd 图，验证 CompiledGraph（n_regs=4，2 输入，1 输出），WGSL 源预览
+- **Demo J** — USB 协议层：crc8、encode_request/decode_response 往返、STATUS 常量、CRC 错误检测、`BlockExecutor::exec(UAdd, {a:21,b:21})=42`、UsbLoopbackExecutor 和 UsbCpuFallbackExecutor 执行 √5≈2.236068
+- **Demo K** — ReservationAwarePolicy：自定义 `EarliestSlotPolicy`，node0 占满 0–100 时路由 10 槽任务到 node1，High/Critical 优先级变体
+- **Demo L** — 真实工作负载图：从 `C:\Users\asus\urp\` 加载 `fft_n64_s6.json`、`fft_n128_s7.json`、`attn_h4_s32.json`、`resnet_8blk_c64.json`，4 个 CPU 节点执行，报告统计
+
+### 工作站 Agent 集成
+- README 新增"工作站 Agent 操作指南"章节：JSON 格式规范、opcode 命名规则对照表、ReLU 正确写法、运行步骤
+- 开发者接手说明更新：PartitionDAGScheduler 集成状态、JSON 图加载工作流、Agent 操作方式
+
+### 死代码清理
+- 所有模块统一 `#![allow(dead_code)]`（库 API 警告预期存在）
+- `NodeType` 枚举添加 `#[allow(dead_code)]`
+- 删除 `AsyncLane.id` 字段（唯一真正未使用的字段）
+
+---
+
+## v1.0
 
 ### USB 外部计算节点
 - `NodeType::Usb` — 新节点类型，可接入 USB CDC 连接的外部计算设备

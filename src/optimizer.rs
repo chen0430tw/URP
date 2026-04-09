@@ -28,10 +28,15 @@ pub fn fuse_linear_blocks(graph: &IRGraph) -> IRGraph {
                     .filter(|e| e.src_block == *a_id && e.dst_block == *b_id)
                     .collect();
 
+                // Only fuse when b needs no external inputs. If b has inputs,
+                // they are named slots that must be filled via the inbox. After
+                // fusion the a→b edge is removed, so any such slot would be
+                // left unsatisfied at runtime.
                 let compatible = a.resource_shape == b.resource_shape
                     && a.required_tag == b.required_tag
                     && a.preferred_zone == b.preferred_zone
-                    && direct_edges.len() == 1;
+                    && direct_edges.len() == 1
+                    && b.inputs.is_empty();
 
                 if compatible {
                     let fused_id = format!("{}+{}", a.block_id, b.block_id);

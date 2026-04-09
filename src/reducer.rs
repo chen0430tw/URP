@@ -21,11 +21,22 @@ impl Reducer for ListReducer {
 
 impl Reducer for SumReducer {
     fn merge(&self, values: &[PayloadValue]) -> String {
-        let sum: i64 = values.iter().filter_map(|v| match v {
-            PayloadValue::I64(x) => Some(*x),
-            _ => None,
-        }).sum();
-        sum.to_string()
+        // If any value is F64, sum as f64; otherwise sum as i64.
+        let has_f64 = values.iter().any(|v| matches!(v, PayloadValue::F64(_)));
+        if has_f64 {
+            let sum: f64 = values.iter().filter_map(|v| match v {
+                PayloadValue::F64(x) => Some(*x),
+                PayloadValue::I64(x) => Some(*x as f64),
+                _ => None,
+            }).sum();
+            sum.to_string()
+        } else {
+            let sum: i64 = values.iter().filter_map(|v| match v {
+                PayloadValue::I64(x) => Some(*x),
+                _ => None,
+            }).sum();
+            sum.to_string()
+        }
     }
 }
 
@@ -37,11 +48,21 @@ impl Reducer for ConcatReducer {
 
 impl Reducer for ReduceMaxReducer {
     fn merge(&self, values: &[PayloadValue]) -> String {
-        let max = values.iter().filter_map(|v| match v {
-            PayloadValue::I64(x) => Some(*x),
-            _ => None,
-        }).max().unwrap_or_default();
-        max.to_string()
+        let has_f64 = values.iter().any(|v| matches!(v, PayloadValue::F64(_)));
+        if has_f64 {
+            let max = values.iter().filter_map(|v| match v {
+                PayloadValue::F64(x) => Some(*x),
+                PayloadValue::I64(x) => Some(*x as f64),
+                _ => None,
+            }).fold(f64::NEG_INFINITY, f64::max);
+            max.to_string()
+        } else {
+            let max = values.iter().filter_map(|v| match v {
+                PayloadValue::I64(x) => Some(*x),
+                _ => None,
+            }).max().unwrap_or_default();
+            max.to_string()
+        }
     }
 }
 
@@ -64,6 +85,7 @@ pub fn run_reducers(grouped: &HashMap<MergeMode, Vec<PayloadValue>>) -> HashMap<
 fn render_value(v: &PayloadValue) -> String {
     match v {
         PayloadValue::I64(x) => x.to_string(),
+        PayloadValue::F64(x) => x.to_string(),
         PayloadValue::Str(s) => s.clone(),
         PayloadValue::List(items) => {
             let parts: Vec<String> = items.iter().map(render_value).collect();
