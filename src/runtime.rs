@@ -233,7 +233,7 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
 
         let shared_inbox  = Arc::new(Mutex::new(init_inbox));
         let shared_log    = Arc::new(Mutex::new(Vec::<PacketLog>::new()));
-        let shared_rings  = Arc::new(Mutex::new(HashMap::<(String, String), LocalRingTunnel>::new()));
+        let _shared_rings = Arc::new(Mutex::new(HashMap::<(String, String), LocalRingTunnel>::new()));
         let shared_remote = Arc::new(Mutex::new(RemotePacketLink::new()));
         let shared_inertia: Arc<Mutex<Vec<(String, String)>>> =
             Arc::new(Mutex::new(Vec::new()));
@@ -251,10 +251,9 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
 
         let partitions_vec: Vec<Partition> = partitions.into_values().collect();
 
-        let (inbox_c, log_c, rings_c, remote_c, inertia_c) = (
+        let (inbox_c, log_c, remote_c, inertia_c) = (
             Arc::clone(&shared_inbox),
             Arc::clone(&shared_log),
-            Arc::clone(&shared_rings),
             Arc::clone(&shared_remote),
             Arc::clone(&shared_inertia),
         );
@@ -269,7 +268,6 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
         let exec_closure = move |partition: Partition| {
             let inbox_c   = Arc::clone(&inbox_c);
             let log_c     = Arc::clone(&log_c);
-            let rings_c   = Arc::clone(&rings_c);
             let remote_c  = Arc::clone(&remote_c);
             let inertia_c = Arc::clone(&inertia_c);
             let exec_reg  = exec_reg.clone();
@@ -331,49 +329,57 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
 
                     // OPTIMIZATION: use pre-built outgoing edge index, O(1) instead of O(E)
                     if let Some(edges) = oe.get(block_id) {
+                        // OPTIMIZATION: collect all updates, then batch-write with one lock each
+                        let mut inbox_updates: Vec<(String, String, PayloadValue)> =
+                            Vec::with_capacity(edges.len());
+                        let mut log_updates: Vec<PacketLog> =
+                            Vec::with_capacity(edges.len());
+
                         for e in edges {
                             let dst_node = bb.get(&e.dst_block).unwrap().clone();
-                            let payload  = PayloadCodec::encode(&value);
-                            let packet   = URPPacket::build(
-                                6, block.merge_mode, &e.src_block, &e.dst_block, &payload,
-                            );
-
                             let src_n = nodes_s.get(&node_id).unwrap();
                             let dst_n = nodes_s.get(&dst_node).unwrap();
                             let is_local = src_n.host_id == dst_n.host_id;
                             let cost     = route_cost(src_n, dst_n);
 
+                            // OPTIMIZATION: same-host routing skips encode/ring/decode entirely
                             let recv_value = if is_local {
-                                let key = (node_id.clone(), dst_node.clone());
-                                let mut guard = rings_c.lock().await;
-                                let ring = guard.entry(key)
-                                    .or_insert_with(|| LocalRingTunnel::new(128));
-                                ring.push(packet).await;
-                                let recv = ring.pop().await;
-                                PayloadCodec::decode(recv.payload())
+                                value.clone()
                             } else {
+                                let payload = PayloadCodec::encode(&value);
+                                let packet  = URPPacket::build(
+                                    6, block.merge_mode, &e.src_block, &e.dst_block, &payload,
+                                );
                                 let recv = remote_c.lock().await.send_legacy(packet).await;
                                 PayloadCodec::decode(recv.payload())
                             };
 
-                            {
-                                let mut inbox = inbox_c.lock().await;
-                                inbox.entry(e.dst_block.clone())
-                                    .or_default()
-                                    .insert(e.input_key.clone(), recv_value);
-                            }
-
-                            log_c.lock().await.push(PacketLog {
+                            inbox_updates.push((
+                                e.dst_block.clone(),
+                                e.input_key.clone(),
+                                recv_value,
+                            ));
+                            log_updates.push(PacketLog {
                                 src_block:    e.src_block.clone(),
                                 dst_block:    e.dst_block.clone(),
                                 src_node:     node_id.clone(),
                                 dst_node:     dst_node.clone(),
-                                route_type:   if is_local { "local-ring" } else { "remote-packet" }
+                                route_type:   if is_local { "local-direct" } else { "remote-packet" }
                                               .to_string(),
                                 partition_id: pm.get(&e.dst_block).unwrap().clone(),
                                 route_cost:   cost,
                             });
                         }
+
+                        // Batch inbox write — one lock for all edges of this block
+                        {
+                            let mut inbox = inbox_c.lock().await;
+                            for (block, key, val) in inbox_updates {
+                                inbox.entry(block).or_default().insert(key, val);
+                            }
+                        }
+                        // Batch log write — one lock for all edges of this block
+                        log_c.lock().await.extend(log_updates);
                     }
                 }
 
@@ -381,7 +387,9 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
             }
         };
 
-        let scheduler = PartitionDAGScheduler::new(1, 1);
+        // OPTIMIZATION: use all logical cores as lane count for parallel partition execution
+        let num_lanes = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let scheduler = PartitionDAGScheduler::new(num_lanes, num_lanes);
         let results = scheduler
             .schedule_and_execute(partitions_vec, &fused_arc, &partition_map, exec_closure)
             .await;
