@@ -9,6 +9,7 @@ use crate::ir::{IRGraph, IRBlock};
 use crate::runtime::BlockExecutionResult;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Semaphore;
 
 /// A partition with its blocks and execution metadata
@@ -191,6 +192,9 @@ impl PartitionDAGScheduler {
     }
 
     /// Execute partitions in DAG topological order, collecting all results.
+    ///
+    /// **OPTIMIZED**: Uses reverse dependency graph to achieve O(P + E) complexity
+    /// instead of O(P²) where P = partitions, E = edges.
     async fn execute_dag_partitions<F, Fut>(
         &self,
         partitions: Vec<Partition>,
@@ -202,9 +206,27 @@ impl PartitionDAGScheduler {
         F: Fn(Partition) -> Fut + Clone,
         Fut: std::future::Future<Output = Vec<BlockExecutionResult>> + Send,
     {
-        // Compute Kahn in-degrees.
+        let total_start = Instant::now();
+
+        // ── Step 1: Build reverse dependency graph (OPTIMIZATION) ─────────────
+        // partition_id -> [partition_ids that depend on it]
+        // Complexity: O(P × D), one-time cost
+        let reverse_deps_start = Instant::now();
+        let mut reverse_deps: HashMap<String, Vec<String>> = HashMap::new();
+        for (pid, deps) in &dag {
+            for dep_pid in deps {
+                reverse_deps.entry(dep_pid.clone())
+                    .or_insert_with(Vec::new)
+                    .push(pid.clone());
+            }
+        }
+        let reverse_deps_time = reverse_deps_start.elapsed();
+
+        // ── Step 2: Compute Kahn in-degrees ───────────────────────────────────
+        let init_start = Instant::now();
         let mut in_degree: HashMap<String, usize> = HashMap::new();
         let mut partition_store: HashMap<String, Partition> = HashMap::new();
+        let total_partitions = partitions.len();
 
         for p in &partitions {
             let deps = dag.get(&p.partition_id).map(|v| v.len()).unwrap_or(0);
@@ -221,31 +243,53 @@ impl PartitionDAGScheduler {
             .collect();
 
         let mut completed: HashSet<String> = HashSet::new();
-        let mut all_results: Vec<BlockExecutionResult> = Vec::new();
+        let mut all_results: Vec<BlockExecutionResult> = Vec::with_capacity(partition_store.len());
+        let init_time = init_start.elapsed();
+
+        // ── Step 3: Execute partitions in topological order ───────────────────
+        let execute_start = Instant::now();
+        let mut total_update_time = std::time::Duration::ZERO;
+        let mut total_execute_time = std::time::Duration::ZERO;
 
         while let Some(partition_id) = ready.pop_front() {
             let partition = partition_store.remove(&partition_id).unwrap();
 
-            // Dispatch to the lane assigned to this partition index.
+            let exec_start = Instant::now();
             let lane_idx = *partition_index.get(&partition_id).unwrap_or(&0) % self.lanes.len();
             let block_results = self.lanes[lane_idx]
                 .execute_partition(partition, executor.clone())
                 .await;
+            total_execute_time += exec_start.elapsed();
             all_results.extend(block_results);
             completed.insert(partition_id.clone());
 
-            // Decrement in-degrees of dependents.
-            for (pid, deps) in &dag {
-                if deps.contains(&partition_id) {
-                    if let Some(deg) = in_degree.get_mut(pid) {
+            // OPTIMIZED: use reverse dependency graph, O(D_incoming) instead of O(P)
+            let update_start = Instant::now();
+            if let Some(deps) = reverse_deps.get(&partition_id) {
+                for dep_pid in deps {
+                    if let Some(deg) = in_degree.get_mut(dep_pid) {
                         *deg -= 1;
-                        if *deg == 0 && !completed.contains(pid) {
-                            ready.push_back(pid.clone());
+                        if *deg == 0 && !completed.contains(dep_pid) {
+                            ready.push_back(dep_pid.clone());
                         }
                     }
                 }
             }
+            total_update_time += update_start.elapsed();
         }
+
+        let execute_time = execute_start.elapsed();
+        let total_time = total_start.elapsed();
+
+        eprintln!("PartitionDAGScheduler performance stats:");
+        eprintln!("  Partitions: {}", total_partitions);
+        eprintln!("  Total time: {:?}", total_time);
+        eprintln!("    - Reverse deps build: {:?}", reverse_deps_time);
+        eprintln!("    - Initialization: {:?}", init_time);
+        eprintln!("    - Execution loop: {:?}", execute_time);
+        eprintln!("      - Partition execution: {:?}", total_execute_time);
+        eprintln!("      - Dependency update: {:?}", total_update_time);
+        eprintln!("  Avg time per partition: {:?}", total_time / total_partitions.max(1) as u32);
 
         all_results
     }

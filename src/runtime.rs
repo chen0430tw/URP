@@ -129,7 +129,6 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
                 .map(|n| n.node_id.clone())
                 .collect();
             if !gpu_node_ids.is_empty() {
-                // WgpuExecutor::new() is async; use pollster to block here.
                 let gpu_exec = pollster::block_on(crate::gpu_executor::WgpuExecutor::new());
                 match gpu_exec {
                     Ok(exec) => {
@@ -167,7 +166,6 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
         };
 
         // ── 2. Build Partition objects (from scheduler.rs) ───────────────
-        // Group blocks by partition ID.
         let mut blocks_by_partition: HashMap<String, Vec<IRBlock>> = HashMap::new();
         for b in &fused.blocks {
             let pid = partition_map.get(&b.block_id).cloned().unwrap_or_default();
@@ -190,9 +188,7 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
             block_binding.insert(b.block_id.clone(), nid);
         }
 
-        // ── 4. Reservation: find backfill windows, then record slots ─────
-        // We compute estimated slot positions based on backfill availability,
-        // then add the reservations so downstream code can query them.
+        // ── 4. Reservation ──────────────────────────────────────────────
         let mut partition_slots: HashMap<String, (u32, u32)> = HashMap::new();
         let now_slot = 0u32;
 
@@ -201,7 +197,6 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
             let est: u32 = partition.blocks.iter().map(|b| b.estimated_duration).sum();
             let est = est.max(1);
 
-            // Find the earliest backfill-compatible slot on this node.
             let slot_start = self.reservations
                 .earliest_start_time(nid, est, now_slot)
                 .unwrap_or(now_slot);
@@ -216,12 +211,21 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
             ));
         }
 
-        // ── 5. Shared execution state (Arc<Mutex<>>) ────────────────────
-        //
-        // `PartitionDAGScheduler` accepts a `Fn(Partition) -> Fut` closure that
-        // is fully responsible for block execution and inter-block routing.
-        // Mutable state is shared via Arc<Mutex<>> so the closure can capture it.
+        // ── 5. Pre-build index structures for O(1) lookups ───────────────
+        // OPTIMIZATION: block_id -> block lookup (avoids O(n) linear scan per block)
+        let block_index: HashMap<String, IRBlock> = fused.blocks.iter()
+            .map(|b| (b.block_id.clone(), b.clone()))
+            .collect();
 
+        // OPTIMIZATION: src_block -> outgoing edges (avoids filtering all edges per block)
+        let mut outgoing_edges: HashMap<String, Vec<crate::ir::IREdge>> = HashMap::new();
+        for e in &fused.edges {
+            outgoing_edges.entry(e.src_block.clone())
+                .or_default()
+                .push(e.clone());
+        }
+
+        // ── 6. Shared execution state (Arc<Mutex<>>) ────────────────────
         let mut init_inbox: HashMap<String, HashMap<String, PayloadValue>> = HashMap::new();
         for b in &fused.blocks {
             init_inbox.insert(b.block_id.clone(), HashMap::new());
@@ -231,7 +235,6 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
         let shared_log    = Arc::new(Mutex::new(Vec::<PacketLog>::new()));
         let shared_rings  = Arc::new(Mutex::new(HashMap::<(String, String), LocalRingTunnel>::new()));
         let shared_remote = Arc::new(Mutex::new(RemotePacketLink::new()));
-        // Collect inertia-key updates: (node_id, key) pairs to apply after execution.
         let shared_inertia: Arc<Mutex<Vec<(String, String)>>> =
             Arc::new(Mutex::new(Vec::new()));
 
@@ -241,8 +244,10 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
         let fused_arc   = Arc::new(fused);
         let bb_arc      = Arc::new(block_binding.clone());
         let pm_arc      = Arc::new(partition_map.clone());
+        let bi_arc      = Arc::new(block_index);
+        let oe_arc      = Arc::new(outgoing_edges);
 
-        // ── 6. Build executor closure and run scheduler ──────────────────
+        // ── 7. Build executor closure and run scheduler ──────────────────
 
         let partitions_vec: Vec<Partition> = partitions.into_values().collect();
 
@@ -253,14 +258,15 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
             Arc::clone(&shared_remote),
             Arc::clone(&shared_inertia),
         );
-        let (fused_ec, bb_ec, pm_ec) = (
+        let (fused_ec, bb_ec, pm_ec, bi_ec, oe_ec) = (
             Arc::clone(&fused_arc),
             Arc::clone(&bb_arc),
             Arc::clone(&pm_arc),
+            Arc::clone(&bi_arc),
+            Arc::clone(&oe_arc),
         );
 
         let exec_closure = move |partition: Partition| {
-            // Clone Arc refs into the async block (each invocation gets its own copy).
             let inbox_c   = Arc::clone(&inbox_c);
             let log_c     = Arc::clone(&log_c);
             let rings_c   = Arc::clone(&rings_c);
@@ -271,27 +277,31 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
             let fused     = Arc::clone(&fused_ec);
             let bb        = Arc::clone(&bb_ec);
             let pm        = Arc::clone(&pm_ec);
+            let bi        = Arc::clone(&bi_ec);   // block index
+            let oe        = Arc::clone(&oe_ec);   // outgoing edges index
             let gs        = graph_start;
 
             async move {
                 let block_order = intra_partition_topo(&partition.blocks, &fused);
-                let mut part_results = Vec::new();
+                let mut part_results = Vec::with_capacity(block_order.len());
+                let node_id  = partition.node_id.clone();
+                let executor = exec_reg.get(&node_id);
+                let executor_name = executor.name().to_string();
+                let is_parallel = exec_reg.is_parallel(&node_id);
 
                 for block_id in &block_order {
-                    let block = fused.blocks.iter()
-                        .find(|b| &b.block_id == block_id)
-                        .unwrap()
-                        .clone();
-                    let ctx = inbox_c.lock().await
-                        .get(block_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let node_id  = partition.node_id.clone();
-                    let executor = exec_reg.get(&node_id);
+                    // OPTIMIZATION: O(1) block lookup instead of O(n) linear scan
+                    let block = bi.get(block_id).unwrap().clone();
+
+                    // Batch inbox read: lock once, get context, release
+                    let ctx = {
+                        let inbox = inbox_c.lock().await;
+                        inbox.get(block_id).cloned().unwrap_or_default()
+                    };
 
                     let block_start_ms = gs.elapsed().as_micros() as u32;
 
-                    let value = if exec_reg.is_parallel(&node_id) {
+                    let value = if is_parallel {
                         let exec_c  = Arc::clone(&executor);
                         let block_c = block.clone();
                         let ctx_c   = ctx.clone();
@@ -302,10 +312,8 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
                         executor.exec(&block, &ctx)
                     };
 
-                    let block_end_ms   = gs.elapsed().as_micros() as u32;
-                    let executor_name  = executor.name().to_string();
+                    let block_end_ms = gs.elapsed().as_micros() as u32;
 
-                    // Collect inertia-key update (applied after scheduler returns).
                     if let Some(key) = &block.inertia_key {
                         inertia_c.lock().await.push((node_id.clone(), key.clone()));
                     }
@@ -318,50 +326,54 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
                         end_time:      block_end_ms,
                         value:         value.clone(),
                         merge_mode:    block.merge_mode,
-                        executor_name,
+                        executor_name: executor_name.clone(),
                     });
 
-                    // Route value to each downstream block.
-                    for e in fused.edges.iter().filter(|e| &e.src_block == block_id) {
-                        let dst_node = bb.get(&e.dst_block).unwrap().clone();
-                        let payload  = PayloadCodec::encode(&value);
-                        let packet   = URPPacket::build(
-                            6, block.merge_mode, &e.src_block, &e.dst_block, &payload,
-                        );
+                    // OPTIMIZATION: use pre-built outgoing edge index, O(1) instead of O(E)
+                    if let Some(edges) = oe.get(block_id) {
+                        for e in edges {
+                            let dst_node = bb.get(&e.dst_block).unwrap().clone();
+                            let payload  = PayloadCodec::encode(&value);
+                            let packet   = URPPacket::build(
+                                6, block.merge_mode, &e.src_block, &e.dst_block, &payload,
+                            );
 
-                        let src_n = nodes_s.get(&node_id).unwrap();
-                        let dst_n = nodes_s.get(&dst_node).unwrap();
-                        let is_local = src_n.host_id == dst_n.host_id;
-                        let cost     = route_cost(src_n, dst_n);
+                            let src_n = nodes_s.get(&node_id).unwrap();
+                            let dst_n = nodes_s.get(&dst_node).unwrap();
+                            let is_local = src_n.host_id == dst_n.host_id;
+                            let cost     = route_cost(src_n, dst_n);
 
-                        let recv_value = if is_local {
-                            let key = (node_id.clone(), dst_node.clone());
-                            let mut guard = rings_c.lock().await;
-                            let ring = guard.entry(key)
-                                .or_insert_with(|| LocalRingTunnel::new(128));
-                            ring.push(packet).await;
-                            let recv = ring.pop().await;
-                            PayloadCodec::decode(recv.payload())
-                        } else {
-                            let recv = remote_c.lock().await.send_legacy(packet).await;
-                            PayloadCodec::decode(recv.payload())
-                        };
+                            let recv_value = if is_local {
+                                let key = (node_id.clone(), dst_node.clone());
+                                let mut guard = rings_c.lock().await;
+                                let ring = guard.entry(key)
+                                    .or_insert_with(|| LocalRingTunnel::new(128));
+                                ring.push(packet).await;
+                                let recv = ring.pop().await;
+                                PayloadCodec::decode(recv.payload())
+                            } else {
+                                let recv = remote_c.lock().await.send_legacy(packet).await;
+                                PayloadCodec::decode(recv.payload())
+                            };
 
-                        inbox_c.lock().await
-                            .entry(e.dst_block.clone())
-                            .or_default()
-                            .insert(e.input_key.clone(), recv_value);
+                            {
+                                let mut inbox = inbox_c.lock().await;
+                                inbox.entry(e.dst_block.clone())
+                                    .or_default()
+                                    .insert(e.input_key.clone(), recv_value);
+                            }
 
-                        log_c.lock().await.push(PacketLog {
-                            src_block:    e.src_block.clone(),
-                            dst_block:    e.dst_block.clone(),
-                            src_node:     node_id.clone(),
-                            dst_node:     dst_node.clone(),
-                            route_type:   if is_local { "local-ring" } else { "remote-packet" }
-                                          .to_string(),
-                            partition_id: pm.get(&e.dst_block).unwrap().clone(),
-                            route_cost:   cost,
-                        });
+                            log_c.lock().await.push(PacketLog {
+                                src_block:    e.src_block.clone(),
+                                dst_block:    e.dst_block.clone(),
+                                src_node:     node_id.clone(),
+                                dst_node:     dst_node.clone(),
+                                route_type:   if is_local { "local-ring" } else { "remote-packet" }
+                                              .to_string(),
+                                partition_id: pm.get(&e.dst_block).unwrap().clone(),
+                                route_cost:   cost,
+                            });
+                        }
                     }
                 }
 
@@ -374,7 +386,7 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
             .schedule_and_execute(partitions_vec, &fused_arc, &partition_map, exec_closure)
             .await;
 
-        // ── 7. Apply inertia updates and accumulate remote counter ───────
+        // ── 8. Apply inertia updates and accumulate remote counter ───────
         for (node_id, key) in shared_inertia.lock().await.drain(..) {
             if let Some(node) = self.nodes.get_mut(&node_id) {
                 node.remember_inertia_key(&key);
@@ -382,7 +394,7 @@ impl<P: SchedulerPolicy> URXRuntime<P> {
         }
         self.remote.sent_packets += shared_remote.lock().await.sent_packets;
 
-        // ── 8. Collect leaf outputs and merge ────────────────────────────
+        // ── 9. Collect leaf outputs and merge ────────────────────────────
         let packet_log = Arc::try_unwrap(shared_log)
             .unwrap()
             .into_inner();
